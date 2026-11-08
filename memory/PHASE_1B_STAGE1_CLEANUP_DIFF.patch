@@ -1,0 +1,13 @@
+diff --git a/frontend/app/app/teacher/locked/page.tsx b/frontend/app/app/teacher/locked/page.tsx
+index 937d612c..eac6bee3 100644
+--- a/frontend/app/app/teacher/locked/page.tsx
++++ b/frontend/app/app/teacher/locked/page.tsx
+@@ -16,7 +16,7 @@ export const metadata: Metadata = { title: 'Get Verified', robots: { index: fals
+ const TEASERS: Record<string, { icon: string; blurb: string; points: string[] }> = {
+   Offerings: { icon: '🧘', blurb: 'Create paid 1:1 & group offerings learners can book.', points: ['Set your price within your tier', 'Publish your session types & availability', 'Appear in learner SmartMatch results'] },
+   Bookings: { icon: '📅', blurb: 'Manage every session in one place.', points: ['See upcoming & past bookings', 'Track attendance and earnings per session', 'Confirm or reschedule with a tap'] },
+-  Wallet: { icon: '👛', blurb: 'Track your recorded earnings.', points: ['Live balance & transaction history', 'Withdrawal requests, when available', 'Withdrawal requests are currently paused.'] },
++  Wallet: { icon: '👛', blurb: 'Track your recorded earnings.', points: ['Live balance & transaction history', 'Withdrawal requests are currently paused.'] },
+   'Refer & Earn': { icon: '🎁', blurb: 'Grow the cooperative and earn rewards.', points: ['Share your personal invite link', 'Earn when teachers you refer get empanelled', 'Track every referral live'] },
+   'City Coordinator': { icon: '🧭', blurb: 'Lead and support teachers in your city.', points: ['Searchable roster of your teachers', 'Milestones and revenue share', 'Help new teachers get onboarded'] },
+   Sessions: { icon: '🗓️', blurb: 'Your teaching calendar in one place.', points: ['See upcoming & past sessions', 'Track attendance and what you earn', 'Prep for your next class at a glance'] },

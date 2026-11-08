@@ -1,0 +1,289 @@
+{
+ "logins": {
+  "learner": true,
+  "teacher": true,
+  "guru": true,
+  "admin": true,
+  "hr": true,
+  "l1_qa": true
+ },
+ "accounts": {
+  "learner": {
+   "role": "employee",
+   "is_verified": null,
+   "is_empanelled": null,
+   "tier": null,
+   "level": null,
+   "kyc_verified": null,
+   "kyc_paid": null,
+   "profile_complete": null,
+   "onboarded": null,
+   "host_eligibility": {
+    "eligible": false,
+    "host_type": null,
+    "platform_fee_pct": null,
+    "reason": "Retreat hosting is available for Council Gurus and empanelled Level 2 (Yoga Pracharak) or Level 3 (Yoga Guru) teachers."
+   }
+  },
+  "teacher": {
+   "role": "teacher",
+   "is_verified": null,
+   "is_empanelled": null,
+   "tier": null,
+   "level": null,
+   "kyc_verified": null,
+   "kyc_paid": null,
+   "profile_complete": null,
+   "onboarded": null,
+   "host_eligibility": {
+    "eligible": true,
+    "host_type": "teacher_guru",
+    "platform_fee_pct": 15,
+    "reason": null
+   }
+  },
+  "guru": {
+   "role": "guru",
+   "is_verified": null,
+   "is_empanelled": null,
+   "tier": null,
+   "level": null,
+   "kyc_verified": null,
+   "kyc_paid": null,
+   "profile_complete": null,
+   "onboarded": null,
+   "host_eligibility": {
+    "eligible": true,
+    "host_type": "council_guru",
+    "platform_fee_pct": 15,
+    "reason": null
+   }
+  },
+  "admin": {
+   "role": "admin",
+   "is_verified": null,
+   "is_empanelled": null,
+   "tier": null,
+   "level": null,
+   "kyc_verified": null,
+   "kyc_paid": null,
+   "profile_complete": null,
+   "onboarded": null,
+   "host_eligibility": {
+    "eligible": false,
+    "host_type": null,
+    "platform_fee_pct": null,
+    "reason": "Retreat hosting is available for Council Gurus and empanelled Level 2 (Yoga Pracharak) or Level 3 (Yoga Guru) teachers."
+   }
+  },
+  "hr": {
+   "role": "hr",
+   "is_verified": null,
+   "is_empanelled": null,
+   "tier": null,
+   "level": null,
+   "kyc_verified": null,
+   "kyc_paid": null,
+   "profile_complete": null,
+   "onboarded": null,
+   "host_eligibility": {
+    "eligible": false,
+    "host_type": null,
+    "platform_fee_pct": null,
+    "reason": "Retreat hosting is available for Council Gurus and empanelled Level 2 (Yoga Pracharak) or Level 3 (Yoga Guru) teachers."
+   }
+  },
+  "l1_qa": {
+   "role": "teacher",
+   "is_verified": null,
+   "is_empanelled": null,
+   "tier": null,
+   "level": null,
+   "kyc_verified": null,
+   "kyc_paid": null,
+   "profile_complete": null,
+   "onboarded": null,
+   "host_eligibility": {
+    "eligible": true,
+    "host_type": "teacher_pracharak",
+    "platform_fee_pct": 15,
+    "reason": null
+   }
+  }
+ },
+ "admin_read_matrix": {
+  "/admin/kyc/pending": {
+   "anon": 401,
+   "learner": 200,
+   "teacher": 200,
+   "guru": 200,
+   "hr": 200,
+   "admin": 200
+  },
+  "/admin/kyc/queue": {
+   "anon": 401,
+   "learner": 200,
+   "teacher": 200,
+   "guru": 200,
+   "hr": 200,
+   "admin": 200
+  },
+  "/admin/kyc/audit-log": {
+   "anon": 401,
+   "learner": 200,
+   "teacher": 200,
+   "guru": 200,
+   "hr": 200,
+   "admin": 200
+  },
+  "/admin/empanelment/teachers": {
+   "anon": 401,
+   "learner": 200,
+   "teacher": 200,
+   "guru": 200,
+   "hr": 200,
+   "admin": 200
+  },
+  "/admin/empanelment/pending": {
+   "anon": 401,
+   "learner": 200,
+   "teacher": 200,
+   "guru": 200,
+   "hr": 200,
+   "admin": 200
+  }
+ },
+ "retreats_public_list": {
+  "count": 6,
+  "statuses": {
+   "filling": 2,
+   "published": 4
+  },
+  "null_venue_partner_id": 6,
+  "qa_like": [
+   "rt_8d568a7a58",
+   "rt_f27d935937",
+   "rt_ec33638e2e",
+   "rt_79636c03d3"
+  ],
+  "dupe_groups": [
+   [
+    "ganesh baug farm stay and yoga retreat (long weekend - leadership retreat for sunpharma)",
+    "2026-11-02"
+   ]
+  ],
+  "past_start": [],
+  "ids": [
+   "rt_8d568a7a58",
+   "rt_c7c3865f34",
+   "rt_41f614da0e",
+   "rt_f27d935937",
+   "rt_ec33638e2e",
+   "rt_79636c03d3"
+  ]
+ },
+ "retreats_mine_teacher": {
+  "status": 404,
+  "count": 0,
+  "qa_like": 0,
+  "null_venue": 0
+ },
+ "retreats_mine_guru": {
+  "status": 404,
+  "count": 0,
+  "qa_like": 0,
+  "null_venue": 0
+ },
+ "teachers_directory": {
+  "total": 41,
+  "public": 39,
+  "city_india_or_blank": 27,
+  "neither_verified_nor_empanelled": 24,
+  "empanelled": 10,
+  "test_like_handles": [
+   "demo-user-india",
+   "yoga-shikshak-demo",
+   "test11",
+   "riya-admin-m"
+  ],
+  "specialisation_vocab_sample": [
+   "Acro Yoga",
+   "Aerial Yoga",
+   "Alignment Yoga",
+   "Anulom Vilom (Alternate Nostril Breathing)",
+   "Anusara Yoga",
+   "Ardha Matsyendrasana (Half Spinal Twist)",
+   "Ashtanga Yoga",
+   "Baddha Konasana (Butterfly Pose)",
+   "Balasana (Child\u2019s Pose)",
+   "Bhakti Yoga",
+   "Bhujangasana",
+   "Breathing Meditation",
+   "Chakra Meditation",
+   "Contemplative Prayer Meditation",
+   "Corporate Yoga",
+   "Guided Meditation",
+   "Hatha Yoga",
+   "Iyengar Yoga",
+   "Karma Yoga",
+   "Kriya Yoga",
+   "Kundalini Yoga",
+   "Mantra Meditation",
+   "Mindfulness Meditation",
+   "Nada Yoga",
+   "Nidra Yoga",
+   "Postnatal Yoga",
+   "Power Yoga",
+   "Pranayama",
+   "Pranayama Yoga",
+   "Prenatal Yoga",
+   "Raja Yoga",
+   "Ramdev Yoga",
+   "Restorative Yoga",
+   "Sarvangasana (Shoulder Stand)",
+   "Self Enquiry Meditation",
+   "Self-Realization Meditation",
+   "Silence Meditation",
+   "Sivananda Yoga",
+   "Stress Management",
+   "Supta Matsyendrasana (Supine Spinal Twist)"
+  ]
+ },
+ "venue_partners": {
+  "count": 5,
+  "statuses": {
+   "active": 5
+  },
+  "with_capacity": 5,
+  "ids": [
+   "vp_ganga_rishikesh",
+   "vp_patnem_goa",
+   "vp_coorg_karnataka",
+   "vp_dharamkot_himachal",
+   "vp_wayanad_kerala"
+  ]
+ },
+ "register_rejections": {
+  "empty_body": {
+   "status": 422,
+   "detail": "[{'type': 'missing', 'loc': ['body', 'email'], 'msg': 'Field required', 'input': {}, 'url': 'https://errors.pydantic.dev/2.12/v/missing'}, {"
+  },
+  "invalid_email": {
+   "status": 422,
+   "detail": "[{'type': 'value_error', 'loc': ['body', 'email'], 'msg': 'value is not a valid email address: An email address must have an @-sign.', 'inpu"
+  },
+  "short_password": {
+   "status": 422,
+   "detail": "[{'type': 'string_too_short', 'loc': ['body', 'password'], 'msg': 'String should have at least 8 characters', 'input': 'short', 'ctx': {'min"
+  },
+  "duplicate_existing": {
+   "status": 400,
+   "detail": "Email already registered. Please login."
+  }
+ },
+ "openapi": {
+  "paths": 645,
+  "security_schemes": [],
+  "create_venue_partner_id_doc": "REQUIRED for creation \u2014 canonical venue_partners.venue_id; must reference an approved, active venue (status=='active'). Enforced in the create handler (422 if missing/ineligible). Optional at the mode"
+ }
+}

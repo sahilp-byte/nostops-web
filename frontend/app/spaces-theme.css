@@ -1,0 +1,128 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   NOSTOPS SPACES — shared visual system (tokens taken from the approved desktop
+   reference screenshots). Scoped: it only applies while a Spaces page is on
+   screen (the page carries `.sp-page`), so the rest of the site keeps its look.
+   Fonts: Merriweather (headings) + Fira Sans (UI), SIL OFL, self-hosted.
+   ───────────────────────────────────────────────────────────────────────────── */
+@font-face { font-family: 'SP Serif'; src: url('/fonts/spaces/Merriweather-700.woff2') format('woff2'); font-weight: 600 800; font-display: swap; }
+@font-face { font-family: 'SP Serif'; src: url('/fonts/spaces/Merriweather-900.woff2') format('woff2'); font-weight: 900; font-display: swap; }
+@font-face { font-family: 'SP Sans'; src: url('/fonts/spaces/FiraSans-Regular.woff2') format('woff2'); font-weight: 400; font-display: swap; }
+@font-face { font-family: 'SP Sans'; src: url('/fonts/spaces/FiraSans-Medium.woff2') format('woff2'); font-weight: 500; font-display: swap; }
+@font-face { font-family: 'SP Sans'; src: url('/fonts/spaces/FiraSans-SemiBold.woff2') format('woff2'); font-weight: 600; font-display: swap; }
+@font-face { font-family: 'SP Sans'; src: url('/fonts/spaces/FiraSans-Bold.woff2') format('woff2'); font-weight: 700 900; font-display: swap; }
+
+body:has(.sp-page) {
+  /* design tokens */
+  --sp-teal: #0F4C4A;          /* serif headings, links */
+  --sp-teal-2: #0E5E5A;
+  --sp-saffron: #F28A1E;       /* primary action */
+  --sp-saffron-2: #E8690C;
+  --sp-saffron-soft: #FDE7CC;  /* active pill / step chip */
+  --sp-peach: #FFF3E3;
+  --sp-ivory: #FFFAF2;
+  --sp-cream: #FCF4E6;
+  --sp-line: #EEDFC8;
+  --sp-field: #D8CCBA;
+  --sp-green: #22A447;
+  --sp-green-soft: #E6F5DC;
+  --sp-lavender: #EEE7FB;
+  --sp-navy: #1C2A47;
+  --sp-shadow: 0 10px 30px -18px rgba(150, 96, 30, .35), 0 1px 2px rgba(150, 96, 30, .06);
+  --sp-serif: 'SP Serif', Merriweather, Georgia, serif;
+  --sp-sans: 'SP Sans', 'Fira Sans', ui-sans-serif, system-ui, sans-serif;
+
+  /* re-point the site tokens so every existing Spaces screen inherits the palette */
+  --color-brand: var(--sp-teal-2);
+  --color-brand-600: var(--sp-teal);
+  --color-brand-700: var(--sp-teal);
+  --color-brand-50: var(--sp-saffron-soft);
+  --color-accent: var(--sp-saffron);
+  --color-accent-600: var(--sp-saffron-2);
+  --color-ink: var(--sp-navy);
+  --color-ink-soft: #3B4762;
+  --color-muted: #6E6A63;
+  --color-line: var(--sp-line);
+  --color-cream: var(--sp-cream);
+  --font-sans: var(--sp-sans);
+  --font-serif: var(--sp-serif);
+
+  background: var(--sp-ivory);
+  font-family: var(--sp-sans);
+  color: var(--sp-navy);
+}
+
+/* Page canvas: warm ivory with soft saffron glow */
+.sp-page { background: radial-gradient(1200px 500px at 0% 0%, #FFF1DC 0%, transparent 60%), radial-gradient(900px 500px at 100% 100%, #FFF3E2 0%, transparent 60%), var(--sp-ivory); }
+
+/* Typography — large teal serif headings */
+body:has(.sp-page) main h1,
+body:has(.sp-page) main h2,
+body:has(.sp-page) main h3 { font-family: var(--sp-serif); color: var(--sp-teal); letter-spacing: -0.01em; }
+body:has(.sp-page) main h1 { font-weight: 900; }
+body:has(.sp-page) main h2, body:has(.sp-page) main h3 { font-weight: 700; }
+body:has(.sp-page) main h1.text-ink, body:has(.sp-page) main h2.text-ink, body:has(.sp-page) main h3.text-ink { color: var(--sp-teal); }
+
+/* Primary actions — saffron gradient pill-rect, as in the references */
+.sp-page .bg-brand, .sp-page .bg-accent, .sp-btn-primary {
+  background-color: var(--sp-saffron);
+  background-image: linear-gradient(180deg, #FFA149 0%, #F28A1E 45%, #E8690C 100%);
+  color: #fff;
+  box-shadow: 0 8px 18px -10px rgba(232, 105, 12, .8), inset 0 1px 0 rgba(255, 255, 255, .25);
+  border-radius: 12px;
+}
+.sp-page .bg-brand:hover, .sp-page .bg-accent:hover, .sp-btn-primary:hover { background-image: linear-gradient(180deg, #F7963A 0%, #E8780F 50%, #D85E08 100%); }
+.sp-page .bg-brand:focus-visible, .sp-page .bg-accent:focus-visible, .sp-btn-primary:focus-visible,
+.sp-btn-secondary:focus-visible { outline: 3px solid #FBC98E; outline-offset: 2px; }
+.sp-page .bg-brand:disabled, .sp-page .bg-accent:disabled, .sp-btn-primary:disabled { filter: grayscale(.4); opacity: .6; box-shadow: none; }
+.sp-btn-primary, .sp-btn-secondary { display: inline-flex; align-items: center; justify-content: center; gap: .6rem; min-height: 52px; padding: 0 1.6rem; font-weight: 600; font-size: 1.05rem; transition: background-color .15s, box-shadow .15s, color .15s; }
+.sp-btn-secondary { background: #fff; color: var(--sp-teal); border: 2px solid var(--sp-teal); border-radius: 12px; }
+.sp-btn-secondary:hover { background: #EEF6F4; }
+
+/* Cards / panels */
+.sp-page .rounded-2xl.border, .sp-page .rounded-3xl.border, .sp-card {
+  border-color: var(--sp-line);
+  box-shadow: var(--sp-shadow);
+}
+.sp-card { background: rgba(255, 255, 255, .92); border: 1px solid var(--sp-line); border-radius: 20px; }
+.sp-panel-peach { background: linear-gradient(135deg, #FFF6EA, #FFEFDC); border: 1px solid #F6DFC0; border-radius: 18px; }
+.sp-panel-green { background: linear-gradient(135deg, #F3FAEC, #E9F5E0); border: 1px solid #D6EBC6; border-radius: 18px; }
+
+/* Form controls */
+.sp-page input:not([type=checkbox]):not([type=radio]):not([type=file]):not([type=range]),
+.sp-page select, .sp-page textarea {
+  border-color: var(--sp-field);
+  border-radius: 10px;
+  background-color: #fff;
+  color: var(--sp-navy);
+  font-family: var(--sp-sans);
+}
+.sp-page input:not([type=checkbox]):not([type=radio]):focus, .sp-page select:focus, .sp-page textarea:focus {
+  border-color: var(--sp-saffron); outline: none; box-shadow: 0 0 0 3px rgba(242, 138, 30, .18);
+}
+.sp-page input::placeholder, .sp-page textarea::placeholder { color: #8A8478; }
+.sp-page input[type=checkbox], .sp-page input[type=radio] { accent-color: var(--sp-saffron); width: 1.15rem; height: 1.15rem; }
+.sp-page label { color: var(--sp-navy); }
+
+/* Links in body copy */
+.sp-page a.underline { color: var(--sp-teal); text-decoration-color: #F2B574; text-underline-offset: 3px; }
+
+/* Header on Spaces pages (public): ivory bar, saffron underline for the active item */
+body:has(.sp-page) > header, body:has(.sp-page) header.sticky { background: rgba(255, 250, 242, .94); border-bottom-color: var(--sp-line); }
+body:has(.sp-page) nav[aria-label=Primary] a:not([class*="bg-brand"]), body:has(.sp-page) nav[aria-label=Primary] button:not([class*="bg-brand"]) { color: #13406A; font-weight: 500; font-size: 15px; }
+body:has(.sp-page) nav[aria-label=Primary] a[aria-current=page] { background: transparent; color: var(--sp-teal); font-weight: 700; box-shadow: inset 0 -3px 0 var(--sp-saffron); border-radius: 0; }
+body:has(.sp-page) nav[aria-label=Primary] a:hover { background: transparent; color: var(--sp-saffron-2); }
+
+/* Footer on Spaces pages: warm band */
+body:has(.sp-page) footer { background: linear-gradient(180deg, #FFF5E6, #FCEBD3); border-top: 1px solid var(--sp-line); position: relative; }
+
+/* Application shell (signed-in Spaces screens) */
+.sp-shell-aside { background: linear-gradient(180deg, #FFF8EE, #FFF3E2); border-right-color: var(--sp-line); }
+.sp-shell-aside nav a[aria-current=page] { background: var(--sp-saffron-soft); color: var(--sp-teal); font-weight: 700; border-radius: 12px; }
+.sp-shell-aside nav a { font-size: 15px; color: #1D3557; }
+
+/* Decorative imagery */
+.sp-fade-left { -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 22%); mask-image: linear-gradient(90deg, transparent 0, #000 22%); }
+.sp-blend { mix-blend-mode: multiply; }
+@media (max-width: 1439px) {
+  .sp-page header nav[aria-label=Primary] a, .sp-page header nav[aria-label=Primary] button { font-size: 13.5px; padding-left: 5px; padding-right: 5px; }
+}

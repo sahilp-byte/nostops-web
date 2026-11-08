@@ -1,0 +1,364 @@
+diff --git a/frontend/app/(public)/become-a-teacher/[city]/page.tsx b/frontend/app/(public)/become-a-teacher/[city]/page.tsx
+index be381ca9..547e98b5 100644
+--- a/frontend/app/(public)/become-a-teacher/[city]/page.tsx
++++ b/frontend/app/(public)/become-a-teacher/[city]/page.tsx
+@@ -73,7 +73,7 @@ const BENEFITS = [
+   { icon: '🏢', title: 'Corporate & group work', desc: 'On-site programmes and organisation wellness — brought to you, not chased by you.' },
+   { icon: '🌐', title: 'A profile that ranks', desc: 'A verified NOSTOPS profile that shows up when seekers search in your city.' },
+   { icon: '🪷', title: 'Guru–Shishya Parampara', desc: 'Your lineage is honoured and displayed — tradition first, marketplace second.' },
+-  { icon: '💳', title: 'Fast, transparent payouts', desc: 'InstaKYC, a wallet, and secure withdrawals to your bank or UPI.' },
++  { icon: '💳', title: 'A transparent earnings wallet', desc: 'InstaKYC and a wallet that records your earnings. Withdrawal options will be announced when available.' },
+ ];
+ 
+ // ── Small presentational helpers (server-safe) ───────────────────────────────
+@@ -337,7 +337,7 @@ export default async function BecomeTeacherCityPage({ params }: { params: Promis
+           <div className="flex flex-col items-center justify-between gap-4 rounded-2xl border border-line bg-white p-6 sm:flex-row">
+             <div>
+               <p className="text-xl font-black tracking-tight text-ink">Have a retreat idea?</p>
+-              <p className="mt-1 max-w-xl text-sm text-ink-soft">Turn your teaching into an experience your students can carry with them. NOSTOPS handles the venue, seats, payments and payouts — you keep the larger share.</p>
++              <p className="mt-1 max-w-xl text-sm text-ink-soft">Turn your teaching into an experience your students can carry with them. NOSTOPS handles the venue, seats and participant payments, and records your share in your wallet — you keep the larger share.</p>
+             </div>
+             <Link href="/app/teacher/retreats/new" className="shrink-0 rounded-xl bg-accent px-5 py-2.5 text-sm font-bold text-white transition hover:bg-accent-600" data-analytics="host_retreat_click">Host your retreat →</Link>
+           </div>
+diff --git a/frontend/app/(public)/become-a-teacher/page.tsx b/frontend/app/(public)/become-a-teacher/page.tsx
+index 6c613a85..f51f7544 100644
+--- a/frontend/app/(public)/become-a-teacher/page.tsx
++++ b/frontend/app/(public)/become-a-teacher/page.tsx
+@@ -41,15 +41,15 @@ const BENEFITS = [
+   { icon: '🏢', title: 'Corporate & group work', desc: 'On-site programmes, workshops and organisation wellness — brought to you, not chased by you.' },
+   { icon: '🌐', title: 'A public profile that ranks', desc: 'A verified NOSTOPS profile that shows up when seekers search for teachers like you.' },
+   { icon: '🪷', title: 'Guru–Shishya Parampara', desc: 'Your lineage is honoured and displayed — tradition first, marketplace second.' },
+-  { icon: '💳', title: 'Fast, transparent payouts', desc: 'InstaKYC, a wallet, and secure withdrawals to your bank or UPI.' },
++  { icon: '💳', title: 'A transparent earnings wallet', desc: 'InstaKYC and a wallet that records your earnings. Withdrawal options will be announced when available.' },
+ ];
+ 
+ const JOURNEY = [
+   { n: '1', t: 'Register', d: 'Create your teacher account in minutes.' },
+   { n: '2', t: 'Build your profile', d: 'Lineage, styles, specialisations and an AI-assisted bio.' },
+-  { n: '3', t: 'InstaKYC', d: 'A one-time verification that unlocks payouts and badges.' },
++  { n: '3', t: 'InstaKYC', d: 'A one-time identity verification for your verified badge and earnings features.' },
+   { n: '4', t: 'Empanelment', d: 'Free merit path or fast-track Council interview.' },
+-  { n: '5', t: 'Active teacher', d: 'Receive bookings, teach, and get paid.' },
++  { n: '5', t: 'Active teacher', d: 'Receive bookings, teach, and earn — your share is recorded in your NOSTOPS wallet.' },
+ ];
+ 
+ export default async function BecomeTeacherPage() {
+diff --git a/frontend/app/(public)/how-it-works/page.tsx b/frontend/app/(public)/how-it-works/page.tsx
+index 2c1c8703..d3fa5f14 100644
+--- a/frontend/app/(public)/how-it-works/page.tsx
++++ b/frontend/app/(public)/how-it-works/page.tsx
+@@ -105,7 +105,7 @@ export default function HowItWorksPage() {
+             <Persona icon="🧘" title="Teachers" points={['Bring your own students', 'Set your own price', 'Keep private economics private', 'Build a lasting reputation']} cta={{ href: '/app/teacher/retreats/new', label: 'Host a retreat' }} />
+             <Persona icon="🏡" title="Venues" points={['Fill rooms with aligned groups', 'Earn occupancy + service revenue', 'Build a hosting track record', 'Get discovered by more teachers']} cta={{ href: '/venues', label: 'Partner your venue' }} />
+             <Persona icon="👥" title="Participants" points={['Practise with a teacher you trust', 'Travel with your own group', 'Better rates together', 'A real, rooted experience']} cta={{ href: '/retreats', label: 'Find a retreat' }} />
+-            <Persona icon="🪷" title="NOSTOPS" points={['Secure payments & payouts', 'Fair, transparent platform fee', 'Teacher-first, always', 'A growing yoga ecosystem']} cta={{ href: '/about', label: 'About NOSTOPS' }} />
++            <Persona icon="🪷" title="NOSTOPS" points={['Secure participant payments', 'Fair, transparent platform fee', 'Teacher-first, always', 'A growing yoga ecosystem']} cta={{ href: '/about', label: 'About NOSTOPS' }} />
+           </div>
+         </section>
+ 
+@@ -115,7 +115,7 @@ export default function HowItWorksPage() {
+         {/* Closing CTA */}
+         <section className="rounded-3xl bg-cream/70 p-8 text-center">
+           <h2 className="text-2xl font-black tracking-tight text-ink">Start your flywheel</h2>
+-          <p className="mx-auto mt-2 max-w-xl text-ink-soft">Create a retreat around your teaching and your students — NOSTOPS handles the venue economics, payments and payouts.</p>
++          <p className="mx-auto mt-2 max-w-xl text-ink-soft">Create a retreat around your teaching and your students — NOSTOPS handles the venue economics and participant payments.</p>
+           <Link href="/app/teacher/retreats/new" className="mt-5 inline-block rounded-xl bg-brand px-6 py-3 text-sm font-bold text-white transition hover:bg-brand-600">Host a retreat →</Link>
+         </section>
+       </div>
+diff --git a/frontend/app/app/teacher/kyc/page.tsx b/frontend/app/app/teacher/kyc/page.tsx
+index a99ffbed..73d392ee 100644
+--- a/frontend/app/app/teacher/kyc/page.tsx
++++ b/frontend/app/app/teacher/kyc/page.tsx
+@@ -15,7 +15,7 @@ export const metadata: Metadata = { title: 'InstaKYC', robots: { index: false, f
+ const VERIFIES = [
+   { icon: '🪪', title: 'Aadhaar OKYC', desc: 'UIDAI-backed identity check' },
+   { icon: '🧾', title: 'PAN', desc: 'Income-tax verification' },
+-  { icon: '🏦', title: 'Bank account', desc: 'Reverse penny-drop for payouts' },
++  { icon: '🏦', title: 'Bank account', desc: 'Reverse penny-drop to verify your bank account' },
+   { icon: '🤳', title: 'Video selfie', desc: 'Liveness match' },
+ ];
+ 
+diff --git a/frontend/app/app/teacher/locked/page.tsx b/frontend/app/app/teacher/locked/page.tsx
+index 1cf40e77..eac6bee3 100644
+--- a/frontend/app/app/teacher/locked/page.tsx
++++ b/frontend/app/app/teacher/locked/page.tsx
+@@ -15,8 +15,8 @@ export const metadata: Metadata = { title: 'Get Verified', robots: { index: fals
+ // Short "what this unlocks" teaser per gated feature — motivates finishing verification.
+ const TEASERS: Record<string, { icon: string; blurb: string; points: string[] }> = {
+   Offerings: { icon: '🧘', blurb: 'Create paid 1:1 & group offerings learners can book.', points: ['Set your price within your tier', 'Publish your session types & availability', 'Appear in learner SmartMatch results'] },
+-  Bookings: { icon: '📅', blurb: 'Manage every session in one place.', points: ['See upcoming & past bookings', 'Track attendance and payouts per session', 'Confirm or reschedule with a tap'] },
+-  Wallet: { icon: '👛', blurb: 'Track your earnings and withdraw securely.', points: ['Live balance & transaction history', 'Withdraw to your verified bank account', 'PIN + OTP protected payouts'] },
++  Bookings: { icon: '📅', blurb: 'Manage every session in one place.', points: ['See upcoming & past bookings', 'Track attendance and earnings per session', 'Confirm or reschedule with a tap'] },
++  Wallet: { icon: '👛', blurb: 'Track your recorded earnings.', points: ['Live balance & transaction history', 'Withdrawal requests are currently paused.'] },
+   'Refer & Earn': { icon: '🎁', blurb: 'Grow the cooperative and earn rewards.', points: ['Share your personal invite link', 'Earn when teachers you refer get empanelled', 'Track every referral live'] },
+   'City Coordinator': { icon: '🧭', blurb: 'Lead and support teachers in your city.', points: ['Searchable roster of your teachers', 'Milestones and revenue share', 'Help new teachers get onboarded'] },
+   Sessions: { icon: '🗓️', blurb: 'Your teaching calendar in one place.', points: ['See upcoming & past sessions', 'Track attendance and what you earn', 'Prep for your next class at a glance'] },
+diff --git a/frontend/app/app/teacher/retreats/new/page.tsx b/frontend/app/app/teacher/retreats/new/page.tsx
+index e2f8e2d4..df106bfa 100644
+--- a/frontend/app/app/teacher/retreats/new/page.tsx
++++ b/frontend/app/app/teacher/retreats/new/page.tsx
+@@ -41,7 +41,7 @@ export default async function NewRetreatPage() {
+         <h1 className="text-2xl font-black tracking-tight text-ink sm:text-3xl">Create your retreat</h1>
+         <p className="mt-1.5 text-ink-soft">
+           Create and host a retreat around your teaching, your students and an experience you believe in. We&apos;ll guide
+-          you step by step — NOSTOPS keeps {elig.platformFeePct}% to run payments, secure seats and handle your payouts.
++          you step by step — NOSTOPS keeps {elig.platformFeePct}% to run payments and secure seats.
+         </p>
+       </div>
+       <HostRetreatWizard
+diff --git a/frontend/app/app/teacher/wallet/page.tsx b/frontend/app/app/teacher/wallet/page.tsx
+index 370f7079..e5187639 100644
+--- a/frontend/app/app/teacher/wallet/page.tsx
++++ b/frontend/app/app/teacher/wallet/page.tsx
+@@ -49,8 +49,9 @@ export default async function TeacherWalletPage() {
+         <>
+           {/* Combined hero */}
+           <section className="rounded-2xl bg-brand p-6 text-white">
+-            <p className="text-sm font-semibold text-white/80">Available to withdraw</p>
++            <p className="text-sm font-semibold text-white/80">Wallet balance</p>
+             <p className="mt-1 text-4xl font-black tracking-tight">{inr(w.withdrawable)}</p>
++            <p className="mt-0.5 text-xs text-white/80">Recorded earnings — not a bank transfer.</p>
+             <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-sm text-white/90">
+               <span>Reserved earnings · {inr(w.combined.held)}</span>
+               <span>Lifetime earned · {inr(w.combined.lifetimeEarned)}</span>
+@@ -100,7 +101,7 @@ export default async function TeacherWalletPage() {
+               <span className={`rounded-full px-2.5 py-0.5 text-xs font-bold ${w.payout.bankVerified ? 'bg-brand-50 text-brand-700' : 'bg-cream text-muted'}`}>Bank {w.payout.bankVerified ? '✓' : 'pending'}</span>
+             </div>
+             {!w.payout.kycVerified && (
+-              <Link href="/app/teacher/kyc" className="mt-3 inline-block text-sm font-bold text-brand-700 hover:underline">Complete InstaKYC to enable withdrawals →</Link>
++              <Link href="/app/teacher/kyc" className="mt-3 inline-block text-sm font-bold text-brand-700 hover:underline">Complete InstaKYC to verify your identity and bank details →</Link>
+             )}
+             {!locked && (
+               <PayoutDetailsForm
+diff --git a/frontend/components/app/teacher/OnboardingWizard.tsx b/frontend/components/app/teacher/OnboardingWizard.tsx
+index 19203d3b..95fbf96f 100644
+--- a/frontend/components/app/teacher/OnboardingWizard.tsx
++++ b/frontend/components/app/teacher/OnboardingWizard.tsx
+@@ -284,7 +284,7 @@ export default function OnboardingWizard({ codex, founding, defaultName, prefill
+           <div className="rounded-xl border border-accent/30 bg-accent/5 px-4 py-3 text-left">
+             <p className="text-xs font-black uppercase tracking-wider text-accent-700">Next step</p>
+             <p className="mt-0.5 text-sm text-ink-soft">
+-              Complete <span className="font-bold text-ink">InstaKYC</span> to verify your identity and progress toward empanelment &amp; payouts. Your profile stays free to edit anytime.
++              Complete <span className="font-bold text-ink">InstaKYC</span> to verify your identity and progress toward empanelment and your earnings wallet. Your profile stays free to edit anytime.
+             </p>
+             <Link href="/app/teacher/kyc" className="mt-2 inline-block text-sm font-bold text-accent-700 hover:underline">
+               Start InstaKYC →
+diff --git a/frontend/components/app/teacher/PayoutDetailsForm.tsx b/frontend/components/app/teacher/PayoutDetailsForm.tsx
+index a9b3b4fe..e1924685 100644
+--- a/frontend/components/app/teacher/PayoutDetailsForm.tsx
++++ b/frontend/components/app/teacher/PayoutDetailsForm.tsx
+@@ -74,7 +74,7 @@ export default function PayoutDetailsForm(props: Props) {
+     });
+     setBusy(false);
+     if (r.ok) {
+-      setOk('Payout details saved ✓ — you can now withdraw.');
++      setOk('Bank details saved ✓');
+       setAccountNumber(''); setConfirmAccount(''); setPin('');
+       setOpen(false);
+       router.refresh();
+diff --git a/frontend/components/app/teacher/PayoutStatus.tsx b/frontend/components/app/teacher/PayoutStatus.tsx
+index ab9f5e60..dc74e5ca 100644
+--- a/frontend/components/app/teacher/PayoutStatus.tsx
++++ b/frontend/components/app/teacher/PayoutStatus.tsx
+@@ -11,7 +11,7 @@ function fmt(ts: number | null): string {
+ // withdrawal sits as pending → processing before it's paid).
+ function pill(status: string): { label: string; cls: string } {
+   const s = status.toLowerCase();
+-  if (['paid', 'success', 'completed', 'settled'].some((x) => s.includes(x))) return { label: 'Paid', cls: 'bg-brand-50 text-brand-700' };
++  if (['paid', 'success', 'completed', 'settled'].some((x) => s.includes(x))) return { label: 'Marked paid', cls: 'bg-brand-50 text-brand-700' };
+   if (['fail', 'reject', 'cancel', 'reverse', 'return'].some((x) => s.includes(x))) return { label: status, cls: 'bg-red-50 text-red-700' };
+   return { label: status || 'Pending', cls: 'bg-amber-50 text-amber-700' };
+ }
+@@ -22,15 +22,15 @@ export default function PayoutStatus({ payouts }: { payouts: Payouts }) {
+   return (
+     <section className="rounded-2xl border border-line bg-white p-5" data-testid="payout-status">
+       <div className="flex items-center justify-between">
+-        <h2 className="text-sm font-extrabold text-ink">Payout status</h2>
++        <h2 className="text-sm font-extrabold text-ink">Withdrawal requests</h2>
+         <div className="flex gap-4 text-xs font-semibold text-muted">
+           <span>Pending · <span className="font-black text-amber-600">{inr(payouts.pending)}</span></span>
+-          <span>Paid out · <span className="font-black text-brand-700">{inr(payouts.totalPaid)}</span></span>
++          <span>Marked paid · <span className="font-black text-brand-700">{inr(payouts.totalPaid)}</span></span>
+         </div>
+       </div>
+ 
+       {payouts.items.length === 0 ? (
+-        <p className="mt-3 text-sm text-muted">No withdrawals yet. Once you withdraw, each payout and its bank-settlement status appears here.</p>
++        <p className="mt-3 text-sm text-muted">No withdrawal requests yet. Each request and the status recorded for it appears here.</p>
+       ) : (
+         <ul className="mt-3 divide-y divide-line p-0">
+           {payouts.items.map((it) => {
+diff --git a/frontend/components/app/teacher/ReferShare.tsx b/frontend/components/app/teacher/ReferShare.tsx
+index 23d018b7..cc408649 100644
+--- a/frontend/components/app/teacher/ReferShare.tsx
++++ b/frontend/components/app/teacher/ReferShare.tsx
+@@ -57,7 +57,7 @@ export default function ReferShare({ code, empanelled, totalEarned, pending, ava
+           <div className="rounded-xl bg-cream/70 p-3"><p className="text-lg font-black text-ink">{inr(totalEarned)}</p><p className="text-xs text-muted">Total earned</p></div>
+           <div className="rounded-xl bg-cream/70 p-3"><p className="text-lg font-black text-ink">{inr(totalWithdrawn)}</p><p className="text-xs text-muted">Withdrawn</p></div>
+         </div>
+-        <a href="/app/teacher/wallet" className="mt-3 block text-center text-sm font-bold text-brand-700 hover:underline">Withdraw from your wallet →</a>
++        <a href="/app/teacher/wallet" className="mt-3 block text-center text-sm font-bold text-brand-700 hover:underline">View your wallet →</a>
+       </section>
+     </div>
+   );
+diff --git a/frontend/components/app/teacher/SettlementLedger.tsx b/frontend/components/app/teacher/SettlementLedger.tsx
+index da68291a..73cbbfbf 100644
+--- a/frontend/components/app/teacher/SettlementLedger.tsx
++++ b/frontend/components/app/teacher/SettlementLedger.tsx
+@@ -25,10 +25,10 @@ export default function SettlementLedger({
+   return (
+     <section data-testid="settlement-ledger">
+       <div className="mb-2 flex items-center justify-between gap-2">
+-        <h2 className="text-sm font-bold uppercase tracking-wider text-muted">Settlement ledger</h2>
++        <h2 className="text-sm font-bold uppercase tracking-wider text-muted">Booking ledger</h2>
+         <span className="rounded-full bg-cream px-2 py-0.5 text-[10px] font-bold text-muted">🔒 Private · auditable</span>
+       </div>
+-      <p className="mb-3 text-[11px] text-muted">Every booking transaction, split into participant payment → NOSTOPS platform fee, venue settlement and your net. Only settled (paid) rows count toward totals; refunds are listed separately.</p>
++      <p className="mb-3 text-[11px] text-muted">Every booking transaction, split into participant payment, NOSTOPS platform fee, venue share and your net. Only rows recorded as paid count toward totals; refunds are listed separately.</p>
+ 
+       {lines.length === 0 ? (
+         <div className="rounded-2xl border border-line bg-white p-6 text-center text-sm text-ink-soft">No transactions yet.</div>
+@@ -60,7 +60,7 @@ export default function SettlementLedger({
+                     {l.refunded ? (
+                       <span className="rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-bold text-red-600">Refunded</span>
+                     ) : l.settled ? (
+-                      <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700">Settled</span>
++                      <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700">Recorded paid</span>
+                     ) : (
+                       <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700">Pending</span>
+                     )}
+@@ -70,7 +70,7 @@ export default function SettlementLedger({
+             </tbody>
+             <tfoot>
+               <tr className="border-t border-line bg-cream/40 text-sm font-black text-ink">
+-                <td className="px-3 py-2.5">Settled totals</td>
++                <td className="px-3 py-2.5">Totals (recorded paid)</td>
+                 <td className="px-3 py-2.5 text-right" data-testid="ledger-total-participant">₹{inr(totals.participantInr)}</td>
+                 <td className="px-3 py-2.5 text-right text-muted">−₹{inr(totals.platformFeeInr)}</td>
+                 <td className="px-3 py-2.5 text-right text-muted">−₹{inr(totals.venueInr)}</td>
+@@ -83,7 +83,7 @@ export default function SettlementLedger({
+       )}
+ 
+       {totals.refundedInr > 0 && (
+-        <p className="mt-2 text-xs text-muted" data-testid="ledger-refunded">Refunds processed: <span className="font-bold text-red-600">₹{inr(totals.refundedInr)}</span> — reversed, not counted in settled totals.</p>
++        <p className="mt-2 text-xs text-muted" data-testid="ledger-refunded">Refunds recorded: <span className="font-bold text-red-600">₹{inr(totals.refundedInr)}</span> — reversed, not counted in totals.</p>
+       )}
+     </section>
+   );
+diff --git a/frontend/components/app/teacher/TeacherOneOnOneSnapshot.tsx b/frontend/components/app/teacher/TeacherOneOnOneSnapshot.tsx
+index b2ab290e..ec93e19c 100644
+--- a/frontend/components/app/teacher/TeacherOneOnOneSnapshot.tsx
++++ b/frontend/components/app/teacher/TeacherOneOnOneSnapshot.tsx
+@@ -39,7 +39,7 @@ export default async function TeacherOneOnOneSnapshot({ verified }: { verified:
+ 
+       {monthly.length > 0 && (
+         <div className="mt-4 rounded-xl border border-line bg-white p-3">
+-          <p className="text-[11px] font-bold uppercase tracking-wider text-muted">Monthly payouts</p>
++          <p className="text-[11px] font-bold uppercase tracking-wider text-muted">Monthly earnings (recorded)</p>
+           <div className="mt-1.5 divide-y divide-line">
+             {monthly.map((m) => (
+               <div key={m.month} className="flex items-center justify-between gap-3 py-1.5" data-testid={`payout-${m.month}`}>
+diff --git a/frontend/components/app/teacher/TeacherProgressCards.tsx b/frontend/components/app/teacher/TeacherProgressCards.tsx
+index 28e8de64..99726f65 100644
+--- a/frontend/components/app/teacher/TeacherProgressCards.tsx
++++ b/frontend/components/app/teacher/TeacherProgressCards.tsx
+@@ -10,7 +10,7 @@ import { instaKycPriceLabel } from '@/lib/pricing';
+ const KYC_POINTS = [
+   'Unlocks your public directory listing & verified badges',
+   'Aadhaar + PAN + bank + liveness selfie — about two minutes',
+-  'Enables secure payouts for your sessions',
++  'Verifies your identity and bank details',
+ ];
+ 
+ const EMPANELMENT_POINTS = [
+@@ -111,7 +111,7 @@ export default function TeacherProgressCards({
+           icon="🛡️"
+           eyebrow="Next · verify your identity"
+           title="Complete NOSTOPS InstaKYC"
+-          desc={`A one-time ${instaKycPriceLabel()} (incl. GST) verification that activates your profile and payouts.`}
++          desc={`A one-time ${instaKycPriceLabel()} (incl. GST) verification. Completes your identity verification step. Teacher verification and empanelment are subject to the applicable review process.`}
+           points={KYC_POINTS}
+           href="/app/teacher/kyc"
+           cta={`Start InstaKYC · ${instaKycPriceLabel()}`}
+diff --git a/frontend/components/app/teacher/WithdrawFlow.tsx b/frontend/components/app/teacher/WithdrawFlow.tsx
+index 54cd460e..4f303ca7 100644
+--- a/frontend/components/app/teacher/WithdrawFlow.tsx
++++ b/frontend/components/app/teacher/WithdrawFlow.tsx
+@@ -30,14 +30,14 @@ function PinSetup({ onDone }: { onDone: (msg: string, ok: boolean) => void }) {
+     setBusy(true);
+     const r = await postBff('/bff/teacher/wallet/setup-pin', { pin });
+     setBusy(false);
+-    if (r.ok) onDone('Wallet PIN set ✓ — you can now withdraw securely.', true);
++    if (r.ok) onDone('Wallet PIN set ✓', true);
+     else setErr(r.data?.error || 'Could not set PIN.');
+   }
+ 
+   return (
+     <div className="rounded-2xl border border-line bg-white p-5">
+       <h2 className="text-sm font-extrabold text-ink">🔐 Set up your wallet PIN</h2>
+-      <p className="mt-1 text-sm text-ink-soft">This 4-digit PIN protects every withdrawal from your wallet.</p>
++      <p className="mt-1 text-sm text-ink-soft">You’ll enter this 4-digit PIN to request a withdrawal from this wallet.</p>
+       <input inputMode="numeric" maxLength={4} value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))} placeholder="Enter 4-digit PIN" className="mt-3 w-full rounded-lg border border-line bg-white px-3 py-2.5 text-center text-lg tracking-[0.5em] text-ink" type="password" data-testid="pin-setup-1" />
+       <input inputMode="numeric" maxLength={4} value={confirm} onChange={(e) => setConfirm(e.target.value.replace(/\D/g, ''))} placeholder="Confirm PIN" className="mt-2 w-full rounded-lg border border-line bg-white px-3 py-2.5 text-center text-lg tracking-[0.5em] text-ink" type="password" data-testid="pin-setup-2" />
+       {err && <p className="mt-2 text-xs font-semibold text-red-600">{err}</p>}
+@@ -114,7 +114,7 @@ export default function WithdrawFlow(props: Props) {
+     setBusy('withdraw');
+     const r = await postBff('/bff/teacher/wallet/withdraw', { amount_inr: amt, pin, payout_method: method });
+     setBusy(null);
+-    if (r.ok) done(`Withdrawal of ${inr(amt)} initiated to your ${method === 'bank' ? 'bank account' : 'UPI'} ✓`, true);
++    if (r.ok) done('Your withdrawal request has been recorded. Withdrawals are currently paused.', true);
+     else setErr(r.data?.error || 'Could not process the withdrawal.');
+   }
+ 
+@@ -189,7 +189,7 @@ export default function WithdrawFlow(props: Props) {
+       <button type="button" onClick={withdraw} disabled={!canWithdraw || busy === 'withdraw'} className="mt-4 w-full rounded-xl bg-brand px-3 py-3 text-sm font-bold text-white disabled:opacity-40" data-testid="withdraw-submit">
+         {busy === 'withdraw' ? 'Processing…' : amt > 0 ? `Withdraw ${inr(net)}` : 'Withdraw'}
+       </button>
+-      <p className="mt-2 text-center text-[11px] text-muted">Secured by your wallet PIN{otpRequired ? ' + SMS OTP' : ''}.</p>
++      <p className="mt-2 text-center text-[11px] text-muted">Withdrawal requests are currently paused.</p>
+     </section>
+   );
+ }
+diff --git a/frontend/components/app/venue/VenueOwnerHome.tsx b/frontend/components/app/venue/VenueOwnerHome.tsx
+index 4a4b1b21..d6661fcd 100644
+--- a/frontend/components/app/venue/VenueOwnerHome.tsx
++++ b/frontend/components/app/venue/VenueOwnerHome.tsx
+@@ -159,9 +159,10 @@ export default function VenueOwnerHome({ state, ownerName }: { state: VenueOwner
+           <p className="mt-0.5 text-xs text-muted">Reserved until each retreat completes.</p>
+         </div>
+         <div className="rounded-2xl border border-line bg-white p-5">
+-          <p className="text-xs font-black uppercase tracking-wide text-muted">Settled to you</p>
++          <p className="text-xs font-black uppercase tracking-wide text-muted">Settlement records</p>
+           <p className="mt-1 text-2xl font-black text-ink">₹{inr(payouts.settled)}</p>
+-          <p className="mt-0.5 text-xs text-muted">{payouts.count} payout{payouts.count === 1 ? '' : 's'} to date.</p>
++          <p className="mt-0.5 text-xs text-muted">{payouts.count} settlement record{payouts.count === 1 ? '' : 's'} to date.</p>
++          <p className="mt-0.5 text-xs text-muted">Records only — not a bank-transfer confirmation.</p>
+         </div>
+         <div className="rounded-2xl border border-line bg-white p-5">
+           <p className="text-xs font-black uppercase tracking-wide text-muted">Your platform fee</p>
+diff --git a/frontend/lib/guides.ts b/frontend/lib/guides.ts
+index 4e1e98e8..a651ca86 100644
+--- a/frontend/lib/guides.ts
++++ b/frontend/lib/guides.ts
+@@ -395,7 +395,7 @@ export const GUIDES: Guide[] = [
+       {
+         heading: 'For teachers: hosting a retreat',
+         body: [
+-          'Teachers on NOSTOPS can select an approved venue, agree the economics, set a participant price, build a cohort and invite their own group — with payments and payouts handled for them.',
++          'Teachers on NOSTOPS can select an approved venue, agree the economics, set a participant price, build a cohort and invite their own group — with participant payments handled for them and their share recorded in their NOSTOPS wallet.',
+           'See how the retreat flywheel works, or list a venue to host teacher-led retreats.',
+         ],
+       },
+diff --git a/frontend/lib/i18n/messages.ts b/frontend/lib/i18n/messages.ts
+index 805bde2c..9c5a4e0c 100644
+--- a/frontend/lib/i18n/messages.ts
++++ b/frontend/lib/i18n/messages.ts
+@@ -115,7 +115,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
+     'Publish my profile': 'Publish my profile',
+     'Your public profile is live': 'Your public profile is live',
+     'View my profile →': 'View my profile →',
+-    'Next: complete InstaKYC to unlock payouts →': 'Next: complete InstaKYC to unlock payouts →',
++    'Next: complete InstaKYC to unlock payouts →': 'Next: complete InstaKYC to verify your account →',
+     'Go to my dashboard': 'Go to my dashboard',
+     'Your teacher profile': 'Your teacher profile',
+     'Edit profile': 'Edit profile',

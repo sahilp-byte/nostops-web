@@ -1,0 +1,828 @@
+diff --git a/backend/ai_onboarding.py b/backend/ai_onboarding.py
+index d01dce81..5a4504c4 100644
+--- a/backend/ai_onboarding.py
++++ b/backend/ai_onboarding.py
+@@ -317,6 +317,21 @@ async def create_order(
+     }
+ 
+ 
++def _matches_order(cf: dict, local: dict) -> bool:
++    """Cashfree's order is the one this module created: same id, amount and currency."""
++    try:
++        amount_ok = abs(float(cf.get("order_amount")) - float(local.get("amount"))) <= 0.01
++    except (TypeError, ValueError):
++        return False
++    return (amount_ok and str(cf.get("order_currency") or "").upper() == str(local.get("currency") or "").upper()
++            and str(cf.get("order_id") or local.get("_id")) == str(local.get("_id")))
++
++
++async def _event_done(key: str, status: str, note: str = "") -> None:
++    await db.ai_onboarding_webhook_events.update_one(
++        {"_id": key}, {"$set": {"status": status, "note": note[:80], "updated_at": now_ms()}})
++
++
+ async def _refresh_status(order_id: str) -> dict:
+     """Authoritative: re-read the order from Cashfree and upsert entitlement when PAID."""
+     try:
+@@ -329,7 +344,11 @@ async def _refresh_status(order_id: str) -> dict:
+         raise HTTPException(status_code=r.status_code, detail=str(data.get("message") or "Order not found."))
+ 
+     status = str(data.get("order_status") or "UNKNOWN").upper()
+-    paid = status == "PAID"
++    order = await db.ai_onboarding_orders.find_one({"_id": order_id}) or {}
++    # P0 Decision 2 — a PAID order counts only when Cashfree's amount + currency equal what
++    # this order was created for; otherwise nothing is granted and the order is flagged.
++    mismatch = status == "PAID" and bool(order) and not _matches_order(data, order)
++    paid = status == "PAID" and not mismatch
+     last_payment = ""
+     if not paid:
+         # Why isn't it paid? The latest payment attempt (FAILED / USER_DROPPED / PENDING),
+@@ -345,8 +364,14 @@ async def _refresh_status(order_id: str) -> dict:
+             last_payment = ""
+     await db.ai_onboarding_orders.update_one(
+         {"_id": order_id},
+-        {"$set": {"status": status, "paid": paid, "last_payment_status": last_payment or None, "updated_at": now_ms()}},
++        {"$set": {"status": status, "paid": paid, "amount_mismatch": mismatch or None,
++                  "last_payment_status": last_payment or None, "updated_at": now_ms()}},
+     )
++    if mismatch:
++        from monitoring import record
++
++        await record("payment", "ai-onboarding:verify", "Paid order does not match the expected amount/currency — nothing granted",
++                     path="/api/ai-onboarding/webhook", context={"order": order_id[:60]})
+     order = await db.ai_onboarding_orders.find_one({"_id": order_id}) or {}
+     sid = order.get("submission_id")
+     if paid and sid:
+@@ -390,7 +415,10 @@ async def webhook(
+     raw = await request.body()
+     if not CF_CLIENT_SECRET or not x_webhook_signature or not x_webhook_timestamp:
+         raise HTTPException(status_code=400, detail="bad webhook")
+-    signed = (x_webhook_timestamp + raw.decode("utf-8")).encode("utf-8")
++    try:
++        signed = (x_webhook_timestamp + raw.decode("utf-8")).encode("utf-8")
++    except UnicodeDecodeError:
++        raise HTTPException(status_code=400, detail="bad webhook")
+     expected = base64.b64encode(
+         hmac.new(CF_CLIENT_SECRET.encode("utf-8"), signed, hashlib.sha256).digest()
+     ).decode("utf-8")
+@@ -426,27 +454,49 @@ async def webhook(
+         if payment_guard.cashfree_mode(CF_API_BASE) != "sandbox" or not local or local.get("mode") != "sandbox":
+             return {"ok": True, "ignored": "preview"}
+ 
+-    # Duplicate delivery (Cashfree is at-least-once): acknowledge, never re-apply.
++    # Duplicate delivery (Cashfree is at-least-once): acknowledge, never re-apply. P0 Decision 2:
++    # an event counts as handled only once it was PROCESSED (or safely ignored); a failed or
++    # interrupted attempt is retried on the provider's next delivery, never acknowledged as done.
+     key = x_idempotency_key or hashlib.sha256(signed).hexdigest()
++    pay_status = str((data.get("payment") or {}).get("payment_status") or "").upper()
++    now = now_ms()
+     try:
+         await db.ai_onboarding_webhook_events.insert_one({
+             "_id": key, "order_id": order_id[:60], "type": str(payload.get("type") or "")[:60],
+-            "received_at": now_ms(),
++            "payment_status": pay_status[:30], "status": "processing", "attempts": 1,
++            "received_at": now, "updated_at": now,
+         })
+     except DuplicateKeyError:
+-        return {"ok": True, "duplicate": True}
++        prev = await db.ai_onboarding_webhook_events.find_one({"_id": key}) or {}
++        if prev.get("status", "processed") in ("processed", "ignored"):  # legacy rows had no status
++            return {"ok": True, "duplicate": True}
++        if prev.get("status") == "processing" and now - int(prev.get("updated_at") or 0) < 60_000:
++            raise HTTPException(status_code=503, detail="already being processed; retry later")
++        took = await db.ai_onboarding_webhook_events.update_one(
++            {"_id": key, "status": prev.get("status"), "updated_at": prev.get("updated_at")},
++            {"$set": {"status": "processing", "updated_at": now}, "$inc": {"attempts": 1}})
++        if not took.modified_count:
++            raise HTTPException(status_code=503, detail="already being processed; retry later")
++
++    from monitoring import record
+ 
+-    pay_status = str((data.get("payment") or {}).get("payment_status") or "").upper()
+     if pay_status in ("FAILED", "USER_DROPPED", "CANCELLED"):
+-        from monitoring import record
+-
+         await record("payment", "ai-onboarding:webhook", f"Customer payment {pay_status.lower()}",
+                      path="/api/ai-onboarding/webhook", context={"order": order_id[:60]})
+-    if order_id:
+-        try:
+-            await _refresh_status(order_id)
+-        except Exception:  # noqa: BLE001 — best-effort; the return-URL poll is the primary path
+-            pass
++    if not order_id.startswith("vob_") or not await db.ai_onboarding_orders.find_one({"_id": order_id}, {"_id": 1}):
++        # Not an order this module created: acknowledged (no retry loop), nothing applied.
++        await _event_done(key, "ignored", "unknown_order")
++        await record("payment", "ai-onboarding:webhook", "Signed notification for an unknown order — ignored",
++                     path="/api/ai-onboarding/webhook", context={"order": order_id[:60]}, alert=False)
++        return {"ok": True, "ignored": "unknown_order"}
++    try:
++        st = await _refresh_status(order_id)  # re-reads the order from Cashfree; never trusts the payload
++    except Exception as exc:  # noqa: BLE001 — not processed: say so, so the provider retries
++        await _event_done(key, "failed", type(exc).__name__)
++        await record("payment", "ai-onboarding:webhook", "Payment notification not processed yet — provider will retry",
++                     path="/api/ai-onboarding/webhook", status=503, context={"order": order_id[:60]})
++        raise HTTPException(status_code=503, detail="not processed; retry later")
++    await _event_done(key, "processed", str(st.get("status") or ""))
+     return {"ok": True}
+ 
+ 
+diff --git a/backend/cashfree_diag.py b/backend/cashfree_diag.py
+new file mode 100644
+index 00000000..c2f4a916
+--- /dev/null
++++ b/backend/cashfree_diag.py
+@@ -0,0 +1,95 @@
++"""P2 (2026-10) — the main backend's Cashfree diagnostic, behind the website gateway.
++
++Upstream, GET /api/payments/cashfree/diag is public: it shows the environment, the last 4 of
++the client id, the secret key's prefix and the API base, and pings Cashfree on every call.
++Through this gateway it is:
++
++  * admin-only — the caller's role is checked on EVERY call (admin_gate), before the cache is
++    read, so a cached answer can never reach a signed-out or non-admin caller;
++  * minimal — environment + three yes/no answers; never an id, prefix, URL or raw provider text;
++  * cached briefly (60 s on success, 10 s on failure; one upstream call at a time), so repeated
++    admin page loads don't ping Cashfree each time. The cached value holds nothing per-user.
++
++The caller's credentials are never sent with the upstream diag call.
++"""
++import asyncio
++import time
++from datetime import datetime, timezone
++
++import httpx
++from fastapi.responses import JSONResponse
++
++import admin_gate
++import payment_guard
++
++PATH = "payments/cashfree/diag"
++TTL_OK_S = 60
++TTL_FAIL_S = 10
++NO_STORE = {"Cache-Control": "no-store, private", "Vary": "Authorization, Cookie"}
++
++_cache: dict = {"body": None, "status": 0, "expires": 0.0}
++_lock = asyncio.Lock()
++
++
++def _key_environment(prefix) -> str:
++    """Which environment the secret key was issued for — used only to compute a yes/no answer."""
++    p = str(prefix or "").lower()
++    if "prod" in p and "test" not in p:
++        return "production"
++    if "test" in p and "prod" not in p:
++        return "sandbox"
++    return "unknown"
++
++
++def _bool(v):
++    return v if isinstance(v, bool) else None
++
++
++def minimal(data: dict) -> dict:
++    """Reduce the upstream diag to the fields an administrator needs. Nothing else is copied."""
++    env = payment_guard.cashfree_mode(data.get("api_base"))
++    declared = str(data.get("env") or "").strip().lower()
++    if env == "unset" or (declared and (declared == "production") != (env == "production")):
++        env = "unknown"  # missing, unrecognised or contradictory configuration
++    key_env = _key_environment(data.get("secret_prefix"))
++    configured = (_bool(data.get("client_id_set")), _bool(data.get("secret_set")))
++    return {
++        "environment": env,
++        "credentials_configured": None if None in configured else all(configured),
++        "credential_type_matches_environment": None if "unknown" in (env, key_env) else key_env == env,
++        "credentials_accepted_by_cashfree": _bool((data.get("cashfree_auth_check") or {}).get("creds_valid")
++                                                  if isinstance(data.get("cashfree_auth_check"), dict) else None),
++    }
++
++
++async def _refresh(client: httpx.AsyncClient) -> None:
++    status, body = 503, {"environment": "unknown", "credentials_configured": None,
++                         "credential_type_matches_environment": None, "credentials_accepted_by_cashfree": None,
++                         "upstream": "unavailable"}
++    try:
++        r = await client.get(f"/api/{PATH}", headers={"Accept": "application/json"}, timeout=15.0)
++        data = r.json() if r.status_code == 200 else None
++        if isinstance(data, dict):
++            status, body = 200, minimal(data)
++    except (httpx.HTTPError, ValueError):
++        pass
++    body["checked_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
++    _cache.update(body=body, status=status, expires=time.monotonic() + (TTL_OK_S if status == 200 else TTL_FAIL_S))
++
++
++async def handle(client: httpx.AsyncClient, method: str, headers) -> JSONResponse:
++    if method.upper() != "GET":
++        return JSONResponse({"detail": "Method not allowed"}, status_code=405, headers=NO_STORE)
++    denied = await admin_gate.check(client, "GET", PATH, headers)
++    if denied is not None:
++        denied.headers.update(NO_STORE)
++        return denied
++    refreshed = False
++    if _cache["body"] is None or time.monotonic() >= _cache["expires"]:
++        async with _lock:  # one upstream call at a time; waiters reuse its answer
++            if _cache["body"] is None or time.monotonic() >= _cache["expires"]:
++                await _refresh(client)
++                refreshed = True
++    body = {**_cache["body"], "cached": not refreshed,
++            "max_age_s": TTL_OK_S if _cache["status"] == 200 else TTL_FAIL_S}
++    return JSONResponse(body, status_code=_cache["status"], headers=NO_STORE)
+diff --git a/backend/financial_lock.py b/backend/financial_lock.py
+index 3ce45a92..15fc053c 100644
+--- a/backend/financial_lock.py
++++ b/backend/financial_lock.py
+@@ -9,6 +9,19 @@ checked here FIRST (before the admin gate makes any upstream call):
+ 
+ A refused call returns 423 and is never forwarded. A test checks this file and the
+ website copy give the same answer for every case.
++
++P0 REMEDIATION (2026-10) — fail closed:
++  * five more money routes found in the deployed route list (paid-state change, split
++    reassignment, credit issue / referral commission) are LOCK rules;
++  * a catch-all LOCK rule refuses any OTHER write whose path names a money action
++    (withdraw, payout, refund, wallet, escrow, ledger, settle, commission, credit, ...),
++    so a new main-backend money route is refused until it is reviewed;
++  * the two body-dependent checks refuse when the body cannot be read as a JSON object.
++Inbound payment notifications are NOT refused (founder decision: record a verified incoming
++payment, release nothing) — see INBOUND_PAYMENT_ROUTES. They must carry a provider signature.
++
++Founder decision 4 (2026-10): the retired Razorpay GET callback is refused (ALWAYS, any method),
++lock or no lock — Razorpay is decommissioned, so nothing may mark a booking paid through it.
+ """
+ import json
+ import os
+@@ -30,7 +43,8 @@ RULES = [
+     ("mock-checkout", "ALWAYS", "ANY", r"^payments/cashfree/mock-checkout(/|$)"),
+     ("mock-card", "ALWAYS", "WRITE", r"^(empanelment/fast-track/[^/]+/pay|premium-sessions/book|bookings/[^/]+/pay)$"),
+     ("self-empanel", "ALWAYS", "WRITE", r"^teachers/me/apply-free-empanelment$"),
+-    ("razorpay", "ALWAYS", "WRITE", r"^payments/razorpay(/|$)"),
++    ("razorpay", "ALWAYS", "WRITE", r"^(payments/razorpay(/|$)|empanelment/fast-track/[^/]+/razorpay-(create|verify)$)"),
++    ("razorpay-callback", "ALWAYS", "ANY", r"^payments/razorpay/callback(/|$)"),
+     ("payout-sweep-read", "LOCK", "ANY", r"^admin/payouts/(list|sweep)(/|$)"),
+     ("wallet-heal", "LOCK", "ANY", r"^admin/wallet/reconcile(/|$)"),
+     ("withdraw", "LOCK", "WRITE",
+@@ -47,20 +61,47 @@ RULES = [
+      r"^(one-on-one/booking/[^/]+/(complete|reassign)$|bookings/[^/]+/complete-pilot$|bookings/check-expired-pilots$"
+      r"|bookings/[^/]+/split-agreement(/|$)|empanelment/claims/sweep-fallback$)"),
+     ("fast-track-split", "LOCK", "WRITE", r"^empanelment/fast-track/[^/]+/decide$"),
++    # P0 (2026-10) — found unprotected in the deployed route list.
++    ("paid-state-change", "LOCK", "WRITE",
++     r"^(retreats/[^/]+/reservations/[^/]+/cancel|empanelment/fast-track/[^/]+/cancel)$"),
++    ("split-reassign", "LOCK", "WRITE", r"^group-booking-agreements/[^/]+/decline$"),
++    ("credit-issue", "LOCK", "WRITE", r"^(gurukul/issue-credit|referrals/[^/]+/status)$"),
++    # Fail-closed catch-all: any other write whose path names a money action.
++    ("money-keyword", "LOCK", "WRITE",
++     r"(^|[/_-])(withdraw[a-z0-9_]*|payouts?|refunds?|wallets?|escrow|ledgers?|settle[a-z0-9_]*|commissions?"
++     r"|earnings?|bonus(es)?|cashback|chargebacks?|reversals?|disburse[a-z0-9_]*|beneficiar[a-z0-9_]*"
++     r"|bank-account|bank-verify|mark-paid|credits?|release[a-z0-9_]*|reconcile[a-z0-9_]*)([/_-]|$)"),
+ ]
+ _COMPILED = [(i, k, m, re.compile(p)) for i, k, m, p in RULES]
+ 
++# Inbound payment notifications: forwarded even while locked (verified incoming payments are
++# recorded; nothing is released). The gateway cannot check the HMAC (the main backend holds the
++# key) but refuses a call that carries no Cashfree signature at all.
++INBOUND_PAYMENT_ROUTES = ("payments/cashfree/webhook", "v1/payments/webhook")
++
++
++def unsigned_webhook(method: str, canonical_path: str, headers) -> bool:
++    return ((method or "").upper() in WRITE and canonical_path in INBOUND_PAYMENT_ROUTES
++            and not (headers.get("x-webhook-signature") and headers.get("x-webhook-timestamp")))
++
+ 
+ def locked() -> bool:
+     return os.environ.get("FINANCIAL_ACTIONS_UNLOCKED", "") != "true"
+ 
+ 
+-def _body_field(body: Optional[bytes], key: str) -> str:
++def _json_object(body: Optional[bytes]) -> Optional[dict]:
++    """The body as a JSON object, or None when it can't be read as one (→ refused)."""
+     try:
+-        v = json.loads(body or b"{}").get(key)
+-    except (ValueError, AttributeError):
+-        return ""
+-    return v.lower() if isinstance(v, str) else ""
++        v = json.loads(body or b"")
++    except (ValueError, TypeError):
++        return None
++    return v if isinstance(v, dict) else None
++
++
++def _is_wallet_topup(obj: Optional[dict]) -> bool:
++    if obj is None:
++        return True
++    return any(obj.get(k) is not None and "wallet" in json.dumps(obj.get(k)).lower() for k in ("order_type", "orderType"))
+ 
+ 
+ def rule_for(method: str, path: str, query: str = "", body: Optional[bytes] = None,
+@@ -71,6 +112,10 @@ def rule_for(method: str, path: str, query: str = "", body: Optional[bytes] = No
+     p = _canonical(path)
+     if p.startswith("api/"):
+         p = p[4:]
++    # A decoded "?" / "#" or a control character would be re-read as a delimiter further on,
++    # so the route checked here would not be the route reached. Always refused.
++    if any(c in p for c in "?#") or any(ord(c) < 32 for c in p):
++        return "bad-path"
+     is_write = m in WRITE
+     for rid, kind, methods, rx in _COMPILED:
+         if kind == "LOCK" and not lock:
+@@ -83,14 +128,18 @@ def rule_for(method: str, path: str, query: str = "", body: Optional[bytes] = No
+             continue
+         return rid
+     if lock and is_write:
+-        if p == "payments/cashfree/orders" and _body_field(body, "order_type") == "wallet_topup":
++        # Wallet top-up credits a wallet: refused unless the body is readable and names no wallet order.
++        if p == "payments/cashfree/orders" and _is_wallet_topup(_json_object(body)):
+             return "wallet-topup"
+-        if re.search(r"^one-on-one/booking/[^/]+/teacher-action$", p) and _body_field(body, "action") == "decline":
+-            return "decline-refund"
++        # Anything but an exact "accept" may decline (and refund) the booking.
++        if re.search(r"^one-on-one/booking/[^/]+/teacher-action$", p):
++            obj = _json_object(body)
++            if obj is None or obj.get("action") != "accept":
++                return "decline-refund"
+     return None
+ 
+ 
+ def refuse(rule_id: str) -> JSONResponse:
+-    always = any(r[0] == rule_id and r[1] == "ALWAYS" for r in RULES)
++    always = rule_id == "bad-path" or any(r[0] == rule_id and r[1] == "ALWAYS" for r in RULES)
+     return JSONResponse({"detail": BLOCKED_ROUTE_MESSAGE if always else FINANCIAL_LOCK_MESSAGE,
+                          "financial_lock": True, "rule": rule_id}, status_code=423)
+diff --git a/backend/institutional.py b/backend/institutional.py
+index 7584befd..8bcabf44 100644
+--- a/backend/institutional.py
++++ b/backend/institutional.py
+@@ -3400,7 +3400,8 @@ class PaymentAttachIn(BaseModel):
+ class PaymentConfirmIn(BaseModel):
+     order_id: str = Field(min_length=3, max_length=200)
+     amount_paid: Optional[float] = None
+-    currency: Optional[str] = Field(default="INR", max_length=8)
++    currency: Optional[str] = Field(default=None, max_length=8)
++    reference_id: Optional[str] = Field(default=None, max_length=200)  # the order's reference (= registration id)
+ 
+ 
+ @router.post("/participant/payment/intent")
+@@ -3435,40 +3436,65 @@ async def participant_payment_attach(body: PaymentAttachIn, _: bool = Depends(re
+     await _ensure()
+     res = await registrations.update_one(
+         {"registration_id": body.registration_id, "booking_status": BOOKING_PENDING_PAYMENT},
+-        {"$set": {"payment_order_id": body.order_id, "updated_at": _now()}})
++        # Every order ever started is kept, so a payment on an earlier checkout is still matched.
++        {"$set": {"payment_order_id": body.order_id, "updated_at": _now()},
++         "$addToSet": {"payment_order_ids": body.order_id}})
+     if res.matched_count == 0:
+         raise HTTPException(status_code=404, detail="pending_registration_not_found")
+     return {"ok": True}
+ 
+ 
++async def _audit_payment_once(rid: str, action: str, order_id: str, meta: dict) -> None:
++    """One audit row per (registration, action, order) — duplicate deliveries add nothing."""
++    if not await event_audit_log.find_one({"entity_id": rid, "action": action, "meta.order_id": order_id}):
++        await _audit("Registration", rid, action, {"user_id": "system", "role": "engine"}, {"order_id": order_id, **meta})
++
++
+ @router.post("/participant/payment/confirm")
+ async def participant_payment_confirm(body: PaymentConfirmIn, _: bool = Depends(require_secret)) -> dict:
+     """Confirm a PENDING_PAYMENT registration AFTER the BFF has re-verified with
+-    the gateway that the order is PAID. Matched by the unique Cashfree order_id;
+-    the paid amount is re-checked against the configured fee. Idempotent."""
++    the gateway that the order is PAID. Matched by the Cashfree order_id (current or an
++    earlier checkout); the paid amount + currency must equal the configured fee. Idempotent.
++    P0 Decision 2: a verified payment that can't confirm a seat (registration no longer
++    pending, or a second payment for a confirmed seat) is RECORDED for review, never lost."""
+     await _ensure()
+-    r = await registrations.find_one({"payment_order_id": body.order_id})
++    oid = body.order_id
++    r = await registrations.find_one({"$or": [{"payment_order_id": oid}, {"payment_order_ids": oid}]})
+     if not r:
+         raise HTTPException(status_code=404, detail="order_not_found")
+-    if r.get("booking_status") == BOOKING_CONFIRMED:
+-        return {"ok": True, "already_confirmed": True, "registration_id": r["registration_id"]}
++    rid = r["registration_id"]
+     fee = float(r.get("amount") or 0)
+-    if body.amount_paid is not None and float(body.amount_paid) + 0.01 < fee:
++    expected_ccy = str(r.get("currency") or "INR").upper()
++    if (body.amount_paid is None or fee <= 0 or abs(float(body.amount_paid) - fee) > 0.01
++            or str(body.currency or "").upper() != expected_ccy
++            or (body.reference_id is not None and body.reference_id != rid)):
++        await _audit("Registration", rid, "PARTICIPANT_PAYMENT_MISMATCH", {"user_id": "system", "role": "engine"},
++                     {"order_id": oid, "amount_paid": body.amount_paid, "currency": body.currency,
++                      "reference_id": body.reference_id})
+         raise HTTPException(status_code=400, detail="amount_mismatch")
++    if r.get("booking_status") == BOOKING_CONFIRMED:
++        if r.get("paid_order_id") in (None, oid):
++            return {"ok": True, "already_confirmed": True, "registration_id": rid}
++        await _audit_payment_once(rid, "PARTICIPANT_DUPLICATE_PAYMENT", oid, {"amount_paid": body.amount_paid})
++        return {"ok": True, "already_confirmed": True, "duplicate_payment": True, "registration_id": rid}
++    if r.get("booking_status") != BOOKING_PENDING_PAYMENT:
++        await _audit_payment_once(rid, "PARTICIPANT_PAYMENT_RECEIVED_NOT_PENDING", oid,
++                                  {"amount_paid": body.amount_paid, "booking_status": r.get("booking_status")})
++        raise HTTPException(status_code=409, detail="registration_not_pending")
+     now = _now()
+     res = await registrations.update_one(
+-        {"registration_id": r["registration_id"], "booking_status": BOOKING_PENDING_PAYMENT},
++        {"registration_id": rid, "booking_status": BOOKING_PENDING_PAYMENT},
+         {"$set": {"booking_status": BOOKING_CONFIRMED, "registration_status": "CONFIRMED",
+-                  "payment_status": PAY_PAID, "paid_at": now, "updated_at": now}})
++                  "payment_status": PAY_PAID, "paid_at": now, "paid_order_id": oid, "updated_at": now}})
+     if res.modified_count:
+-        await _audit("Registration", r["registration_id"], "PARTICIPANT_PAYMENT_CONFIRMED",
+-                     {"user_id": "system", "role": "engine"}, {"order_id": body.order_id})
++        await _audit("Registration", rid, "PARTICIPANT_PAYMENT_CONFIRMED",
++                     {"user_id": "system", "role": "engine"}, {"order_id": oid})
+         ev = await events.find_one({"event_id": r.get("event_id")})
+         org = await organisations.find_one({"organisation_id": r.get("organisation_id")})
+         pt = await participants.find_one({"participant_id": r.get("participant_id")})
+-        doc = await registrations.find_one({"registration_id": r["registration_id"]})
+-        await _send_payment_receipt(doc, ev, org, body.order_id)
+-    return {"ok": True, "registration_id": r["registration_id"]}
++        doc = await registrations.find_one({"registration_id": rid})
++        await _send_payment_receipt(doc, ev, org, oid)
++    return {"ok": True, "registration_id": rid}
+ 
+ 
+ # ══════════════════════════════════════════════════════════════════════════════
+diff --git a/backend/server.py b/backend/server.py
+index 81b2204c..36158c4a 100644
+--- a/backend/server.py
++++ b/backend/server.py
+@@ -168,6 +168,7 @@ async def _error_monitor(request: Request, call_next):
+     return response
+ 
+ import admin_gate  # noqa: E402
++import cashfree_diag  # noqa: E402
+ import financial_lock  # noqa: E402
+ import payment_guard  # noqa: E402
+ import public_privacy  # noqa: E402
+@@ -252,9 +253,22 @@ async def proxy(path: str, request: Request) -> Response:
+     # FINANCIAL SAFETY AUDIT: money actions and state-changing reads are refused
+     # FIRST, before anything (even the admin role check) reaches the main backend.
+     body = await request.body()
++    # Fail closed: an encoded "?" / "#" (%3F / %23) or a control character arrives here decoded
++    # and would be re-parsed by httpx as a query/fragment delimiter, so the upstream would see
++    # a different (possibly money) route than the one checked below. No real route has them.
++    if any(c in s for s in (path, admin_gate._canonical(path)) for c in "?#") or any(ord(c) < 32 for c in path):
++        return JSONResponse({"detail": "bad path"}, status_code=400)
+     locked_rule = financial_lock.rule_for(request.method, path, request.url.query, body)
+     if locked_rule:
+         return financial_lock.refuse(locked_rule)
++    canonical = admin_gate._canonical(path)
++    # Inbound payment notifications pass the lock (they record money coming in) but must at
++    # least carry the provider's signature; the main backend verifies it.
++    if financial_lock.unsigned_webhook(request.method, canonical, request.headers):
++        return JSONResponse({"detail": "bad webhook"}, status_code=400)
++    # P2 — the Cashfree diagnostic: admin-only, minimal and briefly cached at the gateway.
++    if canonical == cashfree_diag.PATH:
++        return await cashfree_diag.handle(_client, request.method, request.headers)
+     # MB-03 / MB-05 at the gateway: an empanelment grant or Fast-Track decision needs a
+     # recorded Policy V2 case (approval + admin activation, or a recorded "not approved").
+     import empanelment_policy  # noqa: E402 — local import keeps startup order unchanged
+@@ -268,7 +282,6 @@ async def proxy(path: str, request: Request) -> Response:
+         denied = await admin_gate.check(_client, request.method, path, request.headers)
+         if denied is not None:
+             return denied
+-    canonical = admin_gate._canonical(path)
+     if (request.method.upper() not in ("GET", "HEAD", "OPTIONS") and _PAYMENT_WRITE.search(canonical)
+             and payment_guard.ingress_blocked(request.headers)):
+         return JSONResponse({"detail": payment_guard.DISABLED_DETAIL, "payments_disabled": True}, status_code=503)
+diff --git a/frontend/app/(public)/retreats/in/[city]/[retreat]/page.tsx b/frontend/app/(public)/retreats/in/[city]/[retreat]/page.tsx
+index 0ac112f4..46ccf899 100644
+--- a/frontend/app/(public)/retreats/in/[city]/[retreat]/page.tsx
++++ b/frontend/app/(public)/retreats/in/[city]/[retreat]/page.tsx
+@@ -52,17 +52,14 @@ import { buildRetreatJsonLd } from '@/lib/retreat-jsonld';
+ import BringYourGroupCta from '@/components/retreats/BringYourGroupCta';
+ import SeatProgress from '@/components/retreats/SeatProgress';
+ 
+-export const revalidate = 900;
++// Rendered per request, like every other public page with live data. With no public
++// retreats at build time nothing was prerendered, so the route was treated as static and
++// the first visit crashed ("static to dynamic at runtime", P2 2026-10). Data fetches below
++// stay cached (fetch-level revalidate), so this costs no extra backend load.
++export const dynamic = 'force-dynamic';
+ 
+ type Params = { params: Promise<{ city: string; retreat: string }>; searchParams?: Promise<Record<string, string | string[] | undefined>> };
+ 
+-// Bounded static generation of the current public retreats; new/overflow served on-demand via ISR.
+-const STATIC_CAP = 100;
+-export async function generateStaticParams() {
+-  const { retreats } = await getPublicRetreats();
+-  return retreats.slice(0, STATIC_CAP).map((r) => ({ city: retreatCitySlug(r.city), retreat: retreatSlug(r) }));
+-}
+-
+ async function fetchRaw(id: string): Promise<{ data: any; status: number }> {
+   try {
+     const data = await apiGet<any>(`/retreats/${id}`, { revalidate: 900 });
+@@ -111,6 +108,7 @@ async function getHostReviews(handle: string): Promise<{ items: { rating: number
+ export async function generateMetadata({ params }: Params): Promise<Metadata> {
+   const { retreat: retreatParam } = await params;
+   const id = retreatIdFromParam(retreatParam);
++  if (!id) return { title: 'Page not found', robots: { index: false, follow: false } };
+   const seo = await getRetreatSeo(id);
+   const raw = await fetchRaw(id);
+   const r = raw.data && raw.data.retreat_id ? toPublicRetreat(raw.data) : null;
+@@ -167,6 +165,8 @@ async function load(id: string) {
+     getVenueEnrichment(id).catch(() => null),
+     getCohortAgg(id),
+   ]);
++  // A backend outage is an error (5xx, retried by crawlers) — never a "not found".
++  if (raw.status === 0 || raw.status >= 500) throw new Error(`retreat backend unavailable (${raw.status})`);
+   if (raw.status === 404 || seo.status === 404) return null;
+   if (!isPublicRetreatRecord(raw.data)) return null;
+   const retreat = toPublicRetreat(raw.data);
+@@ -222,6 +222,7 @@ function Section({ title, children, id, collapsible }: { title: string; children
+ export default async function RetreatDetailPage({ params, searchParams }: Params) {
+   const { city: cityParam, retreat: retreatParam } = await params;
+   const id = retreatIdFromParam(retreatParam);
++  if (!id) notFound();
+   const sp = searchParams ? await searchParams : {};
+   const cohort = typeof sp.cohort === 'string' ? sp.cohort.slice(0, 120) : undefined;
+   const via = typeof sp.via === 'string' ? sp.via.slice(0, 80) : undefined;
+diff --git a/frontend/app/(public)/retreats/in/[city]/page.tsx b/frontend/app/(public)/retreats/in/[city]/page.tsx
+index 3855deba..a266a5b2 100644
+--- a/frontend/app/(public)/retreats/in/[city]/page.tsx
++++ b/frontend/app/(public)/retreats/in/[city]/page.tsx
+@@ -9,23 +9,19 @@ import { getPublicRetreats, type PublicRetreat } from '@/lib/server/retreats';
+ import RetreatCard from '@/components/retreats/RetreatCard';
+ import { retreatPath } from '@/lib/retreat-url';
+ 
+-export const revalidate = 900;
++// Rendered per request (see the detail page): with no public retreats at build time the
++// route was treated as static and crashed on first visit. Fetches stay cached.
++export const dynamic = 'force-dynamic';
+ 
+ type Params = { params: Promise<{ city: string }> };
+ const HOME_URL = canonical('/');
+ const RETREATS_URL = canonical('/retreats');
+ 
+-// Only build location pages that actually have retreats (avoids thin/empty
+-// indexable pages). New cities appear automatically via ISR.
+-export async function generateStaticParams() {
+-  const { retreats } = await getPublicRetreats();
+-  const slugs = new Set<string>();
+-  for (const r of retreats) if (r.city) slugs.add(citySlug(r.city));
+-  return Array.from(slugs).map((city) => ({ city }));
+-}
+-
+ async function loadCity(slug: string): Promise<{ label: string; list: PublicRetreat[] } | null> {
+-  const { retreats } = await getPublicRetreats();
++  if (!/^[a-z0-9-]{1,80}$/.test(slug)) return null;
++  const { retreats, error } = await getPublicRetreats();
++  // A backend outage is an error (5xx), never a "no retreats here" 404.
++  if (error) throw new Error('retreat list unavailable');
+   const list = retreats.filter((r) => r.city && citySlug(r.city) === slug);
+   if (list.length === 0) return null;
+   // Human label: use the actual city string from the first matching retreat.
+diff --git a/frontend/app/bff/institutional/participant/payment/order/route.ts b/frontend/app/bff/institutional/participant/payment/order/route.ts
+index 9d41efd5..821c6121 100644
+--- a/frontend/app/bff/institutional/participant/payment/order/route.ts
++++ b/frontend/app/bff/institutional/participant/payment/order/route.ts
+@@ -21,6 +21,7 @@ import { institutionalFetch } from '@/lib/server/institutional';
+ import { BACKEND_BASE } from '@/lib/api';
+ import { reportPaymentUpstream } from '@/lib/server/monitor';
+ import { paymentsDisabled } from '@/lib/server/payment-guard';
++import { refuseFinancialCall } from '@/lib/server/financial-lock';
+ 
+ export const runtime = 'nodejs';
+ 
+@@ -96,10 +97,15 @@ export async function POST(req: NextRequest) {
+       return_url: returnUrl,
+       note: intent?.event_title ? `NOSTOPS · ${String(intent.event_title).slice(0, 180)}` : undefined,
+     };
+-    const cf = await fetch(`${BACKEND_BASE}/api/payments/cashfree/orders`, {
++    const cfPath = '/payments/cashfree/orders';
++    const cfBody = JSON.stringify(payload);
++    // Same money lock as every other main-backend call (a programme order is not a wallet top-up).
++    const refused = refuseFinancialCall('POST', cfPath, cfBody);
++    if (refused) return NextResponse.json({ error: (await refused.json()).detail }, { status: 423 });
++    const cf = await fetch(`${BACKEND_BASE}/api${cfPath}`, {
+       method: 'POST',
+       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+-      body: JSON.stringify(payload),
++      body: cfBody,
+       cache: 'no-store',
+       signal: AbortSignal.timeout(20000),
+     });
+diff --git a/frontend/lib/api.ts b/frontend/lib/api.ts
+index 27d7e68d..2e25d7ec 100644
+--- a/frontend/lib/api.ts
++++ b/frontend/lib/api.ts
+@@ -1,6 +1,8 @@
+ // Server-only origin for the live NOSTOPS backend. Intentionally NOT a
+ // NEXT_PUBLIC_ variable, so the backend URL is never bundled into client-side
+ // JavaScript. All reads go to the live backend; we never reimplement logic here.
++import { financialLockRule } from '@/lib/financial-lock-rules';
++
+ export const BACKEND_BASE =
+   process.env.BACKEND_URL || 'https://pro-learn-connect-1.emergent.host';
+ 
+@@ -62,6 +64,11 @@ async function applyTrustDecisions<T>(path: string, data: T): Promise<T> {
+ }
+ 
+ function buildUrl(path: string): string {
++  // FINANCIAL SAFETY AUDIT — the public read helpers (GET only) obey the same money lock as
++  // backendFetch, so a state-changing read (payout sweep, wallet heal, mock checkout) can
++  // never be sent from a page either. Throws → the caller's normal error path.
++  const rule = financialLockRule('GET', path, undefined, process.env.FINANCIAL_ACTIONS_UNLOCKED !== 'true');
++  if (rule) throw new Error(`[financial-lock] refused GET (${rule.id})`);
+   const p = path.startsWith('/api')
+     ? path
+     : `/api${path.startsWith('/') ? '' : '/'}${path}`;
+diff --git a/frontend/lib/financial-lock-rules.ts b/frontend/lib/financial-lock-rules.ts
+index da2208a4..30c2db0a 100644
+--- a/frontend/lib/financial-lock-rules.ts
++++ b/frontend/lib/financial-lock-rules.ts
+@@ -16,7 +16,8 @@ export const FINANCIAL_LOCK_RULES: LockRule[] = [
+   { id: 'mock-checkout', kind: 'ALWAYS', methods: 'ANY', pattern: /^payments\/cashfree\/mock-checkout(\/|$)/, why: 'A GET here fires the payment webhook itself (mock mode)' },
+   { id: 'mock-card', kind: 'ALWAYS', methods: 'WRITE', pattern: /^(empanelment\/fast-track\/[^/]+\/pay|premium-sessions\/book|bookings\/[^/]+\/pay)$/, why: 'Marks something paid from a card number alone' },
+   { id: 'self-empanel', kind: 'ALWAYS', methods: 'WRITE', pattern: /^teachers\/me\/apply-free-empanelment$/, why: 'Flips is_empanelled without Policy V2' },
+-  { id: 'razorpay', kind: 'ALWAYS', methods: 'WRITE', pattern: /^payments\/razorpay(\/|$)/, why: 'Decommissioned payment rail' },
++  { id: 'razorpay', kind: 'ALWAYS', methods: 'WRITE', pattern: /^(payments\/razorpay(\/|$)|empanelment\/fast-track\/[^/]+\/razorpay-(create|verify)$)/, why: 'Decommissioned payment rail' },
++  { id: 'razorpay-callback', kind: 'ALWAYS', methods: 'ANY', pattern: /^payments\/razorpay\/callback(\/|$)/, why: 'Retired Razorpay return callback: a GET can mark a booking paid (founder decision 4)' },
+   // ── Locked: reads that change payout state ───────────────────────────────
+   { id: 'payout-sweep-read', kind: 'LOCK', methods: 'ANY', pattern: /^admin\/payouts\/(list|sweep)(\/|$)/, why: 'Runs the cooling→eligible payout sweep on a GET' },
+   { id: 'wallet-heal', kind: 'LOCK', methods: 'ANY', pattern: /^admin\/wallet\/reconcile(\/|$)/, why: 'Can write balances unless heal_direction=report_only' },
+@@ -28,6 +29,12 @@ export const FINANCIAL_LOCK_RULES: LockRule[] = [
+   { id: 'mark-paid', kind: 'LOCK', methods: 'WRITE', pattern: /^(retreats\/[^/]+\/reservations\/[^/]+\/mark-paid|bookings\/[^/]+\/employees\/[^/]+\/mark-paid)$/, why: 'Records a payment without the gateway, crediting a wallet' },
+   { id: 'release', kind: 'LOCK', methods: 'WRITE', pattern: /^(one-on-one\/booking\/[^/]+\/(complete|reassign)$|bookings\/[^/]+\/complete-pilot$|bookings\/check-expired-pilots$|bookings\/[^/]+\/split-agreement(\/|$)|empanelment\/claims\/sweep-fallback$)/, why: 'Releases escrow, realises commission or changes a split' },
+   { id: 'fast-track-split', kind: 'LOCK', methods: 'WRITE', pattern: /^empanelment\/fast-track\/[^/]+\/decide$/, why: 'Realises the non-refundable reviewer revenue split' },
++  // ── P0 (2026-10): found unprotected in the deployed route list ───────────
++  { id: 'paid-state-change', kind: 'LOCK', methods: 'WRITE', pattern: /^(retreats\/[^/]+\/reservations\/[^/]+\/cancel|empanelment\/fast-track\/[^/]+\/cancel)$/, why: 'Changes a paid (or payable) record without the money rules' },
++  { id: 'split-reassign', kind: 'LOCK', methods: 'WRITE', pattern: /^group-booking-agreements\/[^/]+\/decline$/, why: 'Re-assigns a revenue split' },
++  { id: 'credit-issue', kind: 'LOCK', methods: 'WRITE', pattern: /^(gurukul\/issue-credit|referrals\/[^/]+\/status)$/, why: 'Issues a credit or records referral commission' },
++  // ── Fail-closed catch-all: any other write whose path names a money action ─
++  { id: 'money-keyword', kind: 'LOCK', methods: 'WRITE', pattern: /(^|[/_-])(withdraw[a-z0-9_]*|payouts?|refunds?|wallets?|escrow|ledgers?|settle[a-z0-9_]*|commissions?|earnings?|bonus(es)?|cashback|chargebacks?|reversals?|disburse[a-z0-9_]*|beneficiar[a-z0-9_]*|bank-account|bank-verify|mark-paid|credits?|release[a-z0-9_]*|reconcile[a-z0-9_]*)([/_-]|$)/, why: 'Unreviewed money route' },
+ ];
+ 
+ const WRITE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+@@ -51,20 +58,30 @@ export function canonicalPath(raw: string): { path: string; query: URLSearchPara
+   return { path: out.join('/').toLowerCase(), query: new URLSearchParams(queryPart) };
+ }
+ 
+-function bodyField(body: string | undefined, key: string): string {
+-  if (!body) return '';
++/** The body as a JSON object, or null when it can't be read as one (→ refused). */
++function jsonObject(body: string | undefined): Record<string, unknown> | null {
+   try {
+-    const v = JSON.parse(body)?.[key];
+-    return typeof v === 'string' ? v.toLowerCase() : '';
++    const v = JSON.parse(body ?? '');
++    return v && typeof v === 'object' && !Array.isArray(v) ? v : null;
+   } catch {
+-    return '';
++    return null;
+   }
+ }
+ 
++function isWalletTopup(obj: Record<string, unknown> | null): boolean {
++  if (!obj) return true;
++  return ['order_type', 'orderType'].some((k) => obj[k] != null && JSON.stringify(obj[k]).toLowerCase().includes('wallet'));
++}
++
+ /** The rule a call breaks, or null. `locked` = the money lock is on (default). */
+ export function financialLockRule(method: string, rawPath: string, body: string | undefined, locked: boolean): LockRule | null {
+   const m = String(method || 'GET').toUpperCase();
+   const { path, query } = canonicalPath(rawPath);
++  // A "#", a decoded "?" / "#" or a control character would be re-read as a delimiter by the
++  // HTTP client, so the route checked here would not be the route reached. Always refused.
++  if (/[?#\u0000-\u001f]/.test(path) || String(rawPath || '').split('?')[0].includes('#')) {
++    return { id: 'bad-path', kind: 'ALWAYS', methods: 'ANY', pattern: /[?#]/, why: 'Path would not reach the route that was checked' };
++  }
+   const isWrite = WRITE.has(m);
+   for (const r of FINANCIAL_LOCK_RULES) {
+     if (r.kind === 'LOCK' && !locked) continue;
+@@ -74,11 +91,12 @@ export function financialLockRule(method: string, rawPath: string, body: string
+     return r;
+   }
+   if (locked && isWrite) {
+-    // Wallet top-up credits a wallet; a 1:1 "decline" refunds the learner.
+-    if (/^payments\/cashfree\/orders$/.test(path) && bodyField(body, 'order_type') === 'wallet_topup') {
++    // Wallet top-up credits a wallet (refused unless the body is readable and names no wallet
++    // order); anything but an exact 1:1 "accept" may decline and refund the learner.
++    if (/^payments\/cashfree\/orders$/.test(path) && isWalletTopup(jsonObject(body))) {
+       return { id: 'wallet-topup', kind: 'LOCK', methods: 'WRITE', pattern: /^payments\/cashfree\/orders$/, why: 'Credits a wallet' };
+     }
+-    if (/^one-on-one\/booking\/[^/]+\/teacher-action$/.test(path) && bodyField(body, 'action') === 'decline') {
++    if (/^one-on-one\/booking\/[^/]+\/teacher-action$/.test(path) && jsonObject(body)?.action !== 'accept') {
+       return { id: 'decline-refund', kind: 'LOCK', methods: 'WRITE', pattern: /teacher-action$/, why: 'Declining refunds the learner' };
+     }
+   }
+diff --git a/frontend/lib/retreat-url.ts b/frontend/lib/retreat-url.ts
+index ec0788d0..1dff48af 100644
+--- a/frontend/lib/retreat-url.ts
++++ b/frontend/lib/retreat-url.ts
+@@ -49,9 +49,17 @@ export function retreatPath(r: RetreatUrlInput): string {
+   return `/retreats/in/${retreatCitySlug(r.city)}/${retreatSlug(r)}`;
+ }
+ 
+-/** Recover the backend id (rt_…) from a slug/param. Tolerates the bare id too. */
++/** Recover the backend id (rt_…) from a slug/param. Tolerates the bare id too.
++ *  Returns '' for anything that isn't a well-formed retreat id (bad encoding, path
++ *  segments, junk), so callers 404 without ever calling the backend with it. */
+ export function retreatIdFromParam(param: string): string {
+-  const p = decodeURIComponent(param || '');
++  let p = param || '';
++  try {
++    p = decodeURIComponent(p);
++  } catch {
++    /* already decoded / malformed escape: use as-is */
++  }
+   const i = p.lastIndexOf('rt_');
+-  return i >= 0 ? p.slice(i) : p;
++  const id = i >= 0 ? p.slice(i) : '';
++  return /^rt_[A-Za-z0-9_-]{1,64}$/.test(id) ? id : '';
+ }
+diff --git a/frontend/lib/server/bff.ts b/frontend/lib/server/bff.ts
+index 3dd87312..92581365 100644
+--- a/frontend/lib/server/bff.ts
++++ b/frontend/lib/server/bff.ts
+@@ -8,6 +8,7 @@ import { NextRequest, NextResponse } from 'next/server';
+ import { BACKEND_BASE } from '@/lib/api';
+ import { SESSION_COOKIE, cookieOptions } from '@/lib/server/session';
+ import { CSRF_COOKIE, CSRF_HEADER } from '@/lib/session-cookie';
++import { refuseFinancialCall } from '@/lib/server/financial-lock';
+ 
+ const TIMEOUT_MS = 10000;
+ 
+@@ -36,10 +37,13 @@ export function badOrigin(req: NextRequest): boolean {
+ 
+ /** Unauthenticated forward to the backend (login/register/otp/session/reset). */
+ export async function forward(path: string, body: unknown): Promise<Response> {
++  const text = JSON.stringify(body ?? {});
++  const refused = refuseFinancialCall('POST', path, text);
++  if (refused) return refused;
+   return fetch(backendUrl(path), {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+-    body: JSON.stringify(body ?? {}),
++    body: text,
+     cache: 'no-store',
+     signal: AbortSignal.timeout(TIMEOUT_MS),
+   });
+diff --git a/frontend/lib/server/financial-lock.ts b/frontend/lib/server/financial-lock.ts
+index 274f8c57..dab08eab 100644
+--- a/frontend/lib/server/financial-lock.ts
++++ b/frontend/lib/server/financial-lock.ts
+@@ -13,7 +13,10 @@ const detailFor = (r: LockRule) => (r.kind === 'ALWAYS' ? BLOCKED_ROUTE_MESSAGE
+ 
+ /** Called by backendFetch for EVERY main-backend call: a refused call never leaves this server. */
+ export function refuseFinancialCall(method: string, path: string, body?: BodyInit | null): Response | null {
+-  const rule = financialLockRule(method, path, typeof body === 'string' ? body : undefined, financialActionsLocked());
++  // A body that isn't a string (form data, blob, stream) can't be inspected → treated as
++  // unreadable, so the body-dependent rules refuse it (fail closed).
++  const text = typeof body === 'string' ? body : body == null ? undefined : '\u0000';
++  const rule = financialLockRule(method, path, text, financialActionsLocked());
+   if (!rule) return null;
+   console.warn(`[financial-lock] refused ${String(method || 'GET').toUpperCase()} /${canonicalPath(path).path} (${rule.id})`);
+   return new Response(JSON.stringify({ detail: detailFor(rule), financial_lock: true, rule: rule.id }), {
+diff --git a/frontend/lib/server/participant.ts b/frontend/lib/server/participant.ts
+index f6fabce8..1dbe9e89 100644
+--- a/frontend/lib/server/participant.ts
++++ b/frontend/lib/server/participant.ts
+@@ -7,6 +7,7 @@ import { cookies } from 'next/headers';
+ import { PARTICIPANT_COOKIE } from '@/lib/session-cookie';
+ import { institutionalFetch } from '@/lib/server/institutional';
+ import { BACKEND_BASE } from '@/lib/api';
++import { refuseFinancialCall } from '@/lib/server/financial-lock';
+ 
+ export type ParticipantInfo = {
+   participant_id: string;
+@@ -94,8 +95,10 @@ export async function getMyRegistrations(): Promise<ParticipantRegistration[]> {
+ const PAID_STATUSES = new Set(['PAID', 'SUCCESS']);
+ export async function confirmParticipantPayment(orderId: string): Promise<{ status: string; confirmed: boolean }> {
+   if (!/^[A-Za-z0-9_-]{6,128}$/.test(orderId)) return { status: 'UNKNOWN', confirmed: false };
++  const orderPath = `/payments/cashfree/orders/${encodeURIComponent(orderId)}`;
++  if (refuseFinancialCall('GET', orderPath)) return { status: 'UNKNOWN', confirmed: false };
+   try {
+-    const sr = await fetch(`${BACKEND_BASE}/api/payments/cashfree/orders/${encodeURIComponent(orderId)}`, {
++    const sr = await fetch(`${BACKEND_BASE}/api${orderPath}`, {
+       headers: { Accept: 'application/json' },
+       cache: 'no-store',
+       signal: AbortSignal.timeout(15000),
+@@ -107,9 +110,13 @@ export async function confirmParticipantPayment(orderId: string): Promise<{ stat
+       typeof sd?.order_amount === 'number' ? sd.order_amount : typeof sd?.amount === 'number' ? sd.amount : undefined;
+     let confirmed = false;
+     if (PAID_STATUSES.has(status)) {
++      // Currency and reference come from the order itself — never assumed — so the engine can
++      // refuse a payment that doesn't match the registration (P0 Decision 2).
++      const currency = sd?.order_currency || sd?.currency || undefined;
++      const reference = typeof sd?.reference_id === 'string' ? sd.reference_id : undefined;
+       const cr = await institutionalFetch('/participant/payment/confirm', {
+         method: 'POST',
+-        body: { order_id: orderId, amount_paid: amount, currency: sd?.order_currency || sd?.currency || 'INR' },
++        body: { order_id: orderId, amount_paid: amount, currency, reference_id: reference },
+       });
+       confirmed = cr.ok;
+     }
+diff --git a/frontend/lib/server/retreat-og.tsx b/frontend/lib/server/retreat-og.tsx
+index 8e6068b5..e2122713 100644
+--- a/frontend/lib/server/retreat-og.tsx
++++ b/frontend/lib/server/retreat-og.tsx
+@@ -18,7 +18,7 @@ function clamp(s: string, n: number): string {
+ export async function renderRetreatOg(id: string): Promise<ImageResponse> {
+   let r: PublicRetreat | null = null;
+   try {
+-    const raw = await apiGet<any>(`/retreats/${id}`, { revalidate: 300 });
++    const raw = id ? await apiGet<any>(`/retreats/${id}`, { revalidate: 300 }) : null;
+     r = raw ? toPublicRetreat(raw) : null;
+   } catch {
+     r = null;

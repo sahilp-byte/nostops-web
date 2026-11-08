@@ -1,0 +1,60 @@
+diff --git a/frontend/app/app/teacher/locked/page.tsx b/frontend/app/app/teacher/locked/page.tsx
+index ac9c2856..937d612c 100644
+--- a/frontend/app/app/teacher/locked/page.tsx
++++ b/frontend/app/app/teacher/locked/page.tsx
+@@ -16,7 +16,7 @@ export const metadata: Metadata = { title: 'Get Verified', robots: { index: fals
+ const TEASERS: Record<string, { icon: string; blurb: string; points: string[] }> = {
+   Offerings: { icon: '🧘', blurb: 'Create paid 1:1 & group offerings learners can book.', points: ['Set your price within your tier', 'Publish your session types & availability', 'Appear in learner SmartMatch results'] },
+   Bookings: { icon: '📅', blurb: 'Manage every session in one place.', points: ['See upcoming & past bookings', 'Track attendance and earnings per session', 'Confirm or reschedule with a tap'] },
+-  Wallet: { icon: '👛', blurb: 'Track your recorded earnings.', points: ['Live balance & transaction history', 'Withdrawal requests, when available', 'PIN + OTP protected payouts'] },
++  Wallet: { icon: '👛', blurb: 'Track your recorded earnings.', points: ['Live balance & transaction history', 'Withdrawal requests, when available', 'Withdrawal requests are currently paused.'] },
+   'Refer & Earn': { icon: '🎁', blurb: 'Grow the cooperative and earn rewards.', points: ['Share your personal invite link', 'Earn when teachers you refer get empanelled', 'Track every referral live'] },
+   'City Coordinator': { icon: '🧭', blurb: 'Lead and support teachers in your city.', points: ['Searchable roster of your teachers', 'Milestones and revenue share', 'Help new teachers get onboarded'] },
+   Sessions: { icon: '🗓️', blurb: 'Your teaching calendar in one place.', points: ['See upcoming & past sessions', 'Track attendance and what you earn', 'Prep for your next class at a glance'] },
+diff --git a/frontend/components/app/teacher/TeacherProgressCards.tsx b/frontend/components/app/teacher/TeacherProgressCards.tsx
+index bf1dea19..99726f65 100644
+--- a/frontend/components/app/teacher/TeacherProgressCards.tsx
++++ b/frontend/components/app/teacher/TeacherProgressCards.tsx
+@@ -111,7 +111,7 @@ export default function TeacherProgressCards({
+           icon="🛡️"
+           eyebrow="Next · verify your identity"
+           title="Complete NOSTOPS InstaKYC"
+-          desc={`A one-time ${instaKycPriceLabel()} (incl. GST) verification that activates your profile and payouts.`}
++          desc={`A one-time ${instaKycPriceLabel()} (incl. GST) verification. Completes your identity verification step. Teacher verification and empanelment are subject to the applicable review process.`}
+           points={KYC_POINTS}
+           href="/app/teacher/kyc"
+           cta={`Start InstaKYC · ${instaKycPriceLabel()}`}
+diff --git a/frontend/components/app/teacher/WithdrawFlow.tsx b/frontend/components/app/teacher/WithdrawFlow.tsx
+index 2ae9ca15..4f303ca7 100644
+--- a/frontend/components/app/teacher/WithdrawFlow.tsx
++++ b/frontend/components/app/teacher/WithdrawFlow.tsx
+@@ -114,7 +114,7 @@ export default function WithdrawFlow(props: Props) {
+     setBusy('withdraw');
+     const r = await postBff('/bff/teacher/wallet/withdraw', { amount_inr: amt, pin, payout_method: method });
+     setBusy(null);
+-    if (r.ok) done(`Withdrawal of ${inr(amt)} initiated to your ${method === 'bank' ? 'bank account' : 'UPI'} ✓`, true);
++    if (r.ok) done('Your withdrawal request has been recorded. Withdrawals are currently paused.', true);
+     else setErr(r.data?.error || 'Could not process the withdrawal.');
+   }
+ 
+@@ -189,7 +189,7 @@ export default function WithdrawFlow(props: Props) {
+       <button type="button" onClick={withdraw} disabled={!canWithdraw || busy === 'withdraw'} className="mt-4 w-full rounded-xl bg-brand px-3 py-3 text-sm font-bold text-white disabled:opacity-40" data-testid="withdraw-submit">
+         {busy === 'withdraw' ? 'Processing…' : amt > 0 ? `Withdraw ${inr(net)}` : 'Withdraw'}
+       </button>
+-      <p className="mt-2 text-center text-[11px] text-muted">Secured by your wallet PIN{otpRequired ? ' + SMS OTP' : ''}.</p>
++      <p className="mt-2 text-center text-[11px] text-muted">Withdrawal requests are currently paused.</p>
+     </section>
+   );
+ }
+diff --git a/frontend/components/app/venue/VenueOwnerHome.tsx b/frontend/components/app/venue/VenueOwnerHome.tsx
+index b7e8c4e6..d6661fcd 100644
+--- a/frontend/components/app/venue/VenueOwnerHome.tsx
++++ b/frontend/components/app/venue/VenueOwnerHome.tsx
+@@ -162,6 +162,7 @@ export default function VenueOwnerHome({ state, ownerName }: { state: VenueOwner
+           <p className="text-xs font-black uppercase tracking-wide text-muted">Settlement records</p>
+           <p className="mt-1 text-2xl font-black text-ink">₹{inr(payouts.settled)}</p>
+           <p className="mt-0.5 text-xs text-muted">{payouts.count} settlement record{payouts.count === 1 ? '' : 's'} to date.</p>
++          <p className="mt-0.5 text-xs text-muted">Records only — not a bank-transfer confirmation.</p>
+         </div>
+         <div className="rounded-2xl border border-line bg-white p-5">
+           <p className="text-xs font-black uppercase tracking-wide text-muted">Your platform fee</p>

@@ -1,0 +1,1714 @@
+diff --git a/backend/institutional.py b/backend/institutional.py
+index d3643692..c6567976 100644
+--- a/backend/institutional.py
++++ b/backend/institutional.py
+@@ -59,6 +59,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
+ from pydantic import BaseModel, Field
+ from pymongo import ReturnDocument
+ 
++import org_pricing
++
+ try:
+     from email_util import send_email          # when run from /app/backend
+     from receipt_pdf import build_receipt_pdf, format_money_pdf
+@@ -405,8 +407,9 @@ def _event_end_dt(ev: dict) -> Optional["_dt.datetime"]:
+     """§9 — the timezone-aware END datetime of an event, from the configured
+     event_date + (end_time, else start_time + duration_minutes, else end-of-day).
+     Returned in UTC. None when the date is unknown. Completion is gated on THIS
+-    (the end), never merely on the start having passed."""
+-    evd = _parse_date(ev.get("event_date"))
++    (the end), never merely on the start having passed. For a multi-session
++    programme this is the LAST session (end_date)."""
++    evd = _parse_date(ev.get("end_date")) or _parse_date(ev.get("event_date"))
+     if not evd:
+         return None
+     try:
+@@ -439,22 +442,26 @@ def _event_end_dt(ev: dict) -> Optional["_dt.datetime"]:
+ def _effective_lifecycle(ev: dict) -> str:
+     """§7/§9 — derive the live status from the stored lifecycle + the configured
+     schedule. DRAFT / ARCHIVED / EVERGREEN are explicit (admin-controlled) and
+-    never auto-derived. A published event becomes LIVE on its day and COMPLETED
+-    only once its scheduled END time (date + end/start+duration) has passed —
+-    NOT merely because the start time passed."""
++    never auto-derived. A published event becomes LIVE on its (first) day and
++    COMPLETED only once its scheduled END time (last date + end/start+duration)
++    has passed — NOT merely because the start time passed. A multi-session
++    programme (end_date) stays LIVE between its first and last session."""
+     lc = ev.get("lifecycle")
+     if lc in {"DRAFT", "ARCHIVED", "EVERGREEN"}:
+         return lc
+     evd = _parse_date(ev.get("event_date"))
+     if not evd:
+         return lc or "PUBLISHED"
++    last = _parse_date(ev.get("end_date")) or evd
+     now = _dt.datetime.now(_dt.timezone.utc)
+     today = now.date()
+     if evd > today:
+         return "PUBLISHED"
+-    if evd < today:
++    if last < today:
+         return "COMPLETED"
+-    # Event day: LIVE until the computed END time, then COMPLETED (same day).
++    if last > today:
++        return "LIVE"
++    # Last (or only) day: LIVE until the computed END time, then COMPLETED.
+     end_dt = _event_end_dt(ev)
+     if end_dt and now >= end_dt:
+         return "COMPLETED"
+@@ -466,7 +473,7 @@ def _retention_until(ev: dict) -> Optional[str]:
+     until which a completed event is retained (for NOSTOPS archive/evergreen review)."""
+     if _effective_lifecycle(ev) != "COMPLETED":
+         return None
+-    evd = _parse_date(ev.get("event_date"))
++    evd = _parse_date(ev.get("end_date")) or _parse_date(ev.get("event_date"))
+     if not evd:
+         return None
+     return (evd + _dt.timedelta(days=90)).isoformat()
+@@ -600,6 +607,7 @@ async def _ensure():
+     await _safe_index(organisations, "organisation_id", unique=True)
+     await _safe_index(organisations, "slug")
+     await _safe_index(organisations, [("created_by", 1), ("created_at", -1)])
++    await _safe_index(organisations, [("pending_owner_email", 1), ("pending_owner_claimed_at", 1)])
+     await _safe_index(org_members, "member_id", unique=True)
+     await _safe_index(org_members, [("organisation_id", 1), ("user_id", 1)], unique=True)
+     await _safe_index(org_members, "user_id")
+@@ -961,11 +969,107 @@ async def create_organisation(
+     return {"organisation": _public_org(org_doc), "member": _clean(dict(member_doc))}
+ 
+ 
++# ── Enquiry → Organisation (Phase D) ──────────────────────────────────────────
++# An admin turns an organisation enquiry into a ready Organisation in one click.
++# The org has NO member yet: it is held for the enquiry's contact email
++# (pending_owner_email) and joins that person's account as OWNER the first time
++# they sign in with that email (claimed in the org/event list reads below).
++async def create_org_from_enquiry(enq: dict, admin: dict) -> dict:
++    await _ensure()
++    cohort = (enq.get("cohort") or "").strip().upper()
++    if cohort not in COHORT_TYPES:
++        raise HTTPException(status_code=400, detail="This enquiry has no valid organisation type.")
++    email = _norm_email(enq.get("email"))
++    if not email:
++        raise HTTPException(status_code=400, detail="The enquiry has no contact email to invite.")
++    # Enquiry phones were validated loosely — keep one only if it meets the org rule.
++    phone = (enq.get("phone") or "").strip() or None
++    try:
++        _validate_org_contact(email, phone)
++    except HTTPException:
++        phone = None
++    name = (enq.get("organisation_name") or "").strip()[:160]
++    city = (enq.get("city") or "").strip() or None
++    city_slug = _city_slug(city)
++    org_id = await _next_id("Organisation")
++    now = _now()
++    doc = {
++        "organisation_id": org_id,
++        "name": name,
++        "slug": f"{_slugify(name)}-{org_id[-6:]}",
++        "cohort_type": cohort,
++        "description": None,
++        "logo_url": None,
++        "website": None,
++        "primary_city": city,
++        "city_slug": city_slug,
++        "is_launch_city": city_slug in LAUNCH_CITY_SLUGS if city_slug else False,
++        "contact_email": email,
++        "email_domain": email.split("@", 1)[1],
++        "contact_person": (enq.get("contact_name") or "").strip()[:120] or None,
++        "contact_phone": phone,
++        "trust_state": ORG_TRUST_UNVERIFIED,
++        "domain_verified": False,
++        "source_enquiry_id": enq.get("_id") or enq.get("id"),
++        "source_enquiry_ref": enq.get("ref"),
++        "pending_owner_email": email,
++        "pending_owner_name": (enq.get("contact_name") or "").strip()[:120] or None,
++        "pending_owner_claimed_at": None,
++        "created_by": str(admin.get("user_id")),
++        "created_at": now,
++        "updated_at": now,
++    }
++    await organisations.insert_one(dict(doc))
++    await _audit("Organisation", org_id, "ORGANISATION_CREATED_FROM_ENQUIRY", admin,
++                 {"enquiry_ref": enq.get("ref"), "pending_owner_email": email})
++    return _public_org(doc)
++
++
++async def org_claim_status(org_id: str) -> Optional[dict]:
++    o = await organisations.find_one({"organisation_id": org_id})
++    if not o:
++        return None
++    return {"organisation_id": org_id, "name": o.get("name"), "pending_owner_email": o.get("pending_owner_email"),
++            "claimed": bool(o.get("pending_owner_claimed_at")), "claimed_at": o.get("pending_owner_claimed_at")}
++
++
++async def _claim_pending_orgs(user: dict) -> None:
++    """Attach organisations created for this user's email (from an enquiry) as
++    OWNER on their first signed-in visit. Idempotent; one claim per org."""
++    email = _norm_email(user.get("email"))
++    uid = str(user.get("user_id") or "")
++    if not email or not uid:
++        return
++    async for o in organisations.find({"pending_owner_email": email, "pending_owner_claimed_at": None}):
++        now = _now()
++        res = await organisations.update_one(
++            {"organisation_id": o["organisation_id"], "pending_owner_claimed_at": None},
++            {"$set": {"pending_owner_claimed_at": now, "pending_owner_user_id": uid, "updated_at": now}})
++        if not res.modified_count:
++            continue  # claimed concurrently
++        if not await org_members.find_one({"organisation_id": o["organisation_id"], "user_id": uid}):
++            await org_members.insert_one({
++                "member_id": await _next_id("OrganisationMember"),
++                "organisation_id": o["organisation_id"],
++                "user_id": uid,
++                "name": user.get("name") or o.get("pending_owner_name") or email,
++                "email": email,
++                "member_role": MEMBER_OWNER,
++                "event_creator": True,
++                "event_creator_role": ECR_PROGRAMME_CHAMPION,
++                "programme_champion": True,
++                "status": "ACTIVE",
++                "created_at": now,
++            })
++        await _audit("Organisation", o["organisation_id"], "ORGANISATION_CLAIMED", user, {"email": email})
++
++
+ @router.get("/organisations")
+ async def list_my_organisations(user: dict = Depends(current_user)) -> dict:
+     """Organisations the caller is a member of (membership-scoped — never leaks
+     other orgs)."""
+     await _ensure()
++    await _claim_pending_orgs(user)
+     uid = str(user.get("user_id"))
+     mems = await org_members.find({"user_id": uid}).to_list(length=500)
+     org_ids = [m["organisation_id"] for m in mems]
+@@ -1371,6 +1475,121 @@ async def update_organisation(
+     return {"organisation": _public_org(out)}
+ 
+ 
++# ── Multi-session programme schedule (Phase C) ───────────────────────────────
++# One event = one programme; participants register ONCE for the whole series.
++# A RECURRING schedule repeats on chosen weekdays (ISO 1=Mon … 7=Sun) from a
++# start date for 1/3/6/12 calendar months. event_date = first session,
++# end_date = last session; the generated sessions live in inst_event_sessions.
++SCHEDULE_MONTHS = (1, 3, 6, 12)
++SCHEDULE_MAX_WEEKDAYS = 5
++_WEEKDAY_NAMES = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
++
++
++class ScheduleIn(BaseModel):
++    type: str = "SINGLE"                 # SINGLE | RECURRING
++    weekdays: List[int] = []
++    months: int = 1
++
++
++def _normalise_schedule(s: Optional[ScheduleIn]) -> dict:
++    if not s or (s.type or "").strip().upper() != "RECURRING":
++        return {"type": "SINGLE"}
++    days = sorted(set(s.weekdays or []))
++    if not days or any(d < 1 or d > 7 for d in days) or len(days) > SCHEDULE_MAX_WEEKDAYS:
++        raise HTTPException(status_code=400, detail="Choose between 1 and 5 weekdays for a repeating programme.")
++    if s.months not in SCHEDULE_MONTHS:
++        raise HTTPException(status_code=400, detail="Programme length must be 1, 3, 6 or 12 months.")
++    return {"type": "RECURRING", "weekdays": days, "months": s.months}
++
++
++def _add_months(d: _dt.date, months: int) -> _dt.date:
++    m = d.month - 1 + months
++    y, m = d.year + m // 12, m % 12 + 1
++    last_day = [31, 29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28,
++                31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
++    return _dt.date(y, m, min(d.day, last_day))
++
++
++def _schedule_dates(ev: dict) -> List[_dt.date]:
++    """Session dates for a RECURRING schedule: every chosen weekday from the
++    start date up to (not including) start + N calendar months."""
++    s = ev.get("schedule") or {}
++    if s.get("type") != "RECURRING":
++        return []
++    start = _parse_date(s.get("start_date") or ev.get("event_date"))
++    if not start:
++        return []
++    end = _add_months(start, int(s.get("months") or 1))
++    days = set(s.get("weekdays") or [])
++    out, d = [], start
++    while d < end:
++        if d.isoweekday() in days:
++            out.append(d)
++        d += _dt.timedelta(days=1)
++    return out
++
++
++def _schedule_patch(ev: dict) -> dict:
++    """Derived schedule fields: first/last session dates + session count."""
++    s = ev.get("schedule") or {}
++    if s.get("type") != "RECURRING":
++        return {"end_date": None}
++    dates = _schedule_dates(ev)
++    if not dates:
++        return {"end_date": None, "schedule": {**s, "session_count": 0}}
++    return {"event_date": dates[0].isoformat(), "end_date": dates[-1].isoformat(),
++            "schedule": {**s, "session_count": len(dates)}}
++
++
++async def _write_sessions(ev: dict) -> None:
++    """Replace the event's generated sessions (idempotent on every save)."""
++    await event_sessions.delete_many({"event_id": ev["event_id"]})
++    dates = _schedule_dates(ev)
++    if not dates:
++        return
++    now = _now()
++    await event_sessions.insert_many([{
++        "session_id": f"{ev['event_id']}-S{i:03d}",
++        "event_id": ev["event_id"],
++        "seq": i,
++        "date": d.isoformat(),
++        "start_time": ev.get("start_time"),
++        "duration_minutes": ev.get("duration_minutes") or 60,
++        "timezone": ev.get("timezone") or DEFAULT_TIMEZONE,
++        "starts_at": f"{d.isoformat()}T{ev.get('start_time') or '00:00'}",
++        "status": "SCHEDULED",
++        "created_at": now,
++    } for i, d in enumerate(dates, start=1)])
++
++
++def _when(ev: dict, fallback: str) -> str:
++    """Human 'when' line for emails — a repeating programme names its series."""
++    base = " · ".join([x for x in [ev.get("event_date"), ev.get("start_time")] if x])
++    s = ev.get("schedule") or {}
++    if base and s.get("type") == "RECURRING" and s.get("session_count"):
++        days = " & ".join(_WEEKDAY_NAMES[d] for d in s.get("weekdays") or [])
++        return f"{base} (first of {s['session_count']} sessions, every {days} until {ev.get('end_date')})"
++    return base or fallback
++
++
++def _price_estimate(ev: dict) -> Optional[dict]:
++    """Organiser-only estimate from the published organisation rates, saved with
++    the event for reference (never shown publicly; final pricing by NOSTOPS)."""
++    cohort, cap = ev.get("cohort_type"), ev.get("capacity")
++    if cohort not in org_pricing.COHORT_RATES or not isinstance(cap, int) or cap < 1:
++        return None
++    s = ev.get("schedule") or {}
++    if s.get("type") == "RECURRING":
++        months = int(s.get("months") or 1)
++        sessions = s.get("session_count") or org_pricing.SESSIONS_PER_MONTH * months
++    else:
++        months, sessions = 1, 1
++    lo, hi = org_pricing.PARTICIPANT_RANGE
++    return {**org_pricing.estimate(cohort, months, cap, sessions), "months": months, "participants": cap,
++            "cohort": cohort, "currency": "INR", "within_published_range": lo <= cap <= hi,
++            "basis": "NOSTOPS published organisation rates", "computed_at": _now()}
++
++
+ # ── Events ────────────────────────────────────────────────────────────────────
+ class EventCreate(BaseModel):
+     organisation_id: str
+@@ -1394,6 +1613,7 @@ class EventCreate(BaseModel):
+     pricing_type: Optional[str] = PRICING_FREE
+     participant_fee: Optional[int] = Field(default=None, ge=0, le=1000000)  # configurable per-event INR fee (PAID only)
+     programme_champion_member_id: Optional[str] = None
++    schedule: Optional[ScheduleIn] = None
+ 
+ 
+ class EventUpdate(BaseModel):
+@@ -1416,6 +1636,7 @@ class EventUpdate(BaseModel):
+     pricing_type: Optional[str] = None
+     participant_fee: Optional[int] = Field(default=None, ge=0, le=1000000)
+     programme_champion_member_id: Optional[str] = None
++    schedule: Optional[ScheduleIn] = None
+ 
+ 
+ async def _resolve_champion(org_id: str, member_id: Optional[str]) -> Optional[dict]:
+@@ -1625,7 +1846,14 @@ async def create_event(body: EventCreate, user: dict = Depends(current_user)) ->
+         "updated_at": now,
+         "published_at": None,
+     }
++    sched = _normalise_schedule(body.schedule)
++    if sched["type"] == "RECURRING":
++        sched["start_date"] = body.event_date or None
++    doc["schedule"] = sched
++    doc.update(_schedule_patch(doc))
++    doc["price_estimate"] = _price_estimate(doc)
+     await events.insert_one(dict(doc))
++    await _write_sessions(doc)
+     await _audit("Event", event_id, "EVENT_DRAFT_CREATED", user, {"organisation_id": org["organisation_id"]})
+     return {"event": _owner_event(doc)}
+ 
+@@ -1670,19 +1898,34 @@ async def update_event(event_id: str, body: EventUpdate, user: dict = Depends(cu
+         upd["participant_fee"] = int(body.participant_fee) or None
+     if body.programme_champion_member_id is not None:
+         upd["programme_champion"] = await _resolve_champion(ev["organisation_id"], body.programme_champion_member_id)
++    if body.schedule is not None or body.event_date is not None:
++        prev = ev.get("schedule") or {"type": "SINGLE"}
++        sched = _normalise_schedule(body.schedule) if body.schedule is not None else dict(prev)
++        if sched["type"] == "RECURRING":
++            sched["start_date"] = (body.event_date.strip() or None) if body.event_date is not None \
++                else (prev.get("start_date") or ev.get("event_date"))
++        else:
++            sched.pop("start_date", None)
++        upd["schedule"] = sched
+     await events.update_one({"event_id": event_id}, {"$set": upd})
+     # Recompute the transparent economics + matching inputs from the merged event.
+     merged = await events.find_one({"event_id": event_id})
++    merged.update(_schedule_patch(merged))
+     snap = merged.get("programme_snapshot") or {}
+     vt = _normalise_venue_type(merged.get("venue_type"))
+     ext_cost = merged.get("external_venue_cost") if vt == VENUE_EXTERNAL else None
+     await events.update_one({"event_id": event_id}, {"$set": {
++        "event_date": merged.get("event_date"),
++        "end_date": merged.get("end_date"),
++        "schedule": merged.get("schedule") or {"type": "SINGLE"},
++        "price_estimate": _price_estimate(merged),
+         "external_venue_cost": ext_cost,
+         "economics_inputs": _economics_inputs(
+             snap, capacity=merged.get("capacity"), duration_minutes=merged.get("duration_minutes") or 60,
+             city=merged.get("city"), venue_type=vt, external_venue_cost=ext_cost),
+         "matching_inputs": _matching_inputs(snap, language=merged.get("language") or "English", city=merged.get("city")),
+     }})
++    await _write_sessions(merged)
+     out = await events.find_one({"event_id": event_id})
+     return {"event": _owner_event(out)}
+ 
+@@ -1756,6 +1999,7 @@ async def publish_event(event_id: str, user: dict = Depends(current_user)) -> di
+ async def list_my_events(user: dict = Depends(current_user)) -> dict:
+     """Events across all orgs the caller is an authorised member of."""
+     await _ensure()
++    await _claim_pending_orgs(user)
+     uid = str(user.get("user_id"))
+     mems = await org_members.find({"user_id": uid, "status": "ACTIVE"}).to_list(length=500)
+     org_ids = [m["organisation_id"] for m in mems if _can_create_events(m)]
+@@ -1839,6 +2083,12 @@ async def duplicate_event(event_id: str, user: dict = Depends(current_user)) ->
+         "updated_at": now,
+         "published_at": None,
+     }
++    # Keep the repeating pattern (weekdays + length); dates are re-set by the creator.
++    src_sched = src.get("schedule") or {}
++    doc["schedule"] = ({"type": "RECURRING", "weekdays": src_sched.get("weekdays") or [], "months": src_sched.get("months") or 1}
++                       if src_sched.get("type") == "RECURRING" else {"type": "SINGLE"})
++    doc["end_date"] = None
++    doc["price_estimate"] = _price_estimate(doc)
+     await events.insert_one(dict(doc))
+     await _audit("Event", new_id, "EVENT_DUPLICATED", user, {"source_event_id": src["event_id"]})
+     return {"event": _owner_event(doc)}
+@@ -2051,7 +2301,7 @@ async def coordinator_flag_event(event_id: str, body: EventFlagIn,
+                  {"user_id": str(user.get("user_id")), "role": role}, ctx)
+     # Notify organiser contact + NOSTOPS care — event reference only, no PII.
+     org = await organisations.find_one({"organisation_id": ev.get("organisation_id")})
+-    when = " · ".join([x for x in [ev.get("event_date"), ev.get("start_time")] if x]) or "soon"
++    when = _when(ev, "soon")
+     body_html = (
+         f'<p style="margin:0 0 8px"><strong>Risk flagged:</strong> {AT_RISK_LABELS.get(reason, reason)}</p>'
+         f'<p style="margin:0 0 8px"><strong>Event:</strong> {ev.get("title")} ({ev.get("event_id")})</p>'
+@@ -2481,6 +2731,9 @@ def _public_event(ev: dict, org: Optional[dict], confirmed_count: int = 0) -> di
+             "content_status": snap.get("content_status"),
+         },
+         "event_date": ev.get("event_date"),
++        "end_date": ev.get("end_date"),
++        "schedule": ({k: (ev.get("schedule") or {}).get(k) for k in ("type", "weekdays", "months", "session_count")}
++                     if (ev.get("schedule") or {}).get("type") == "RECURRING" else None),
+         "start_time": ev.get("start_time"),
+         "end_time": ev.get("end_time"),
+         "duration_minutes": ev.get("duration_minutes"),
+@@ -2606,7 +2859,12 @@ async def get_public_event(slug: str, _: bool = Depends(require_secret)) -> dict
+         raise HTTPException(status_code=404, detail="not_found")
+     org = await organisations.find_one({"organisation_id": ev["organisation_id"]})
+     confirmed = await registrations.count_documents({"event_id": ev["event_id"], "booking_status": BOOKING_CONFIRMED})
+-    return {"event": _public_event(ev, org, confirmed)}
++    out = _public_event(ev, org, confirmed)
++    # Multi-session programme — the full session list for the public schedule.
++    out["sessions"] = await event_sessions.find(
++        {"event_id": ev["event_id"]}, {"_id": 0, "seq": 1, "date": 1, "start_time": 1, "duration_minutes": 1},
++    ).sort("seq", 1).to_list(length=400) if out.get("schedule") else []
++    return {"event": out}
+ 
+ 
+ @router.get("/public/showcase")
+@@ -3939,7 +4197,7 @@ async def public_certificate_verify(code: str, _: bool = Depends(require_secret)
+ def _reminder_html(name: Optional[str], ev: dict, org: Optional[dict], kind: str) -> str:
+     hi = f" {name}" if name else ""
+     title = ev.get("title") or "your NOSTOPS programme"
+-    when = " · ".join([x for x in [ev.get("event_date"), ev.get("start_time")] if x]) or "soon"
++    when = _when(ev, "soon")
+     where = ev.get("venue") or ev.get("city") or ""
+     if kind == "reminder":
+         head = "See you tomorrow 🧘"
+@@ -4129,7 +4387,7 @@ def _simple_email(head: str, body_html: str, cta_text: Optional[str] = None, cta
+ 
+ def _teacher_match_html(name: Optional[str], ev: dict) -> str:
+     hi = f" {name}" if name else ""
+-    when = " · ".join([x for x in [ev.get("event_date"), ev.get("start_time")] if x]) or "a date to be confirmed"
++    when = _when(ev, "a date to be confirmed")
+     where = ev.get("venue") or ev.get("city") or ""
+     body = (f'<p style="margin:0 0 8px;line-height:1.5">Namaste{hi}, you&rsquo;ve been offered to lead '
+             f'<strong>{ev.get("title") or "a NOSTOPS programme"}</strong> on {when}'
+@@ -4144,7 +4402,7 @@ async def _send_registration_confirmation(reg: dict, ev: dict, org: Optional[dic
+         return
+     waitlisted = reg.get("booking_status") == BOOKING_WAITLISTED
+     title = ev.get("title") or "your NOSTOPS programme"
+-    when = " · ".join([x for x in [ev.get("event_date"), ev.get("start_time")] if x]) or "soon"
++    when = _when(ev, "soon")
+     where = ev.get("venue") or ev.get("city") or ""
+     org_name = (org or {}).get("name")
+     if waitlisted:
+@@ -4187,7 +4445,7 @@ async def _send_payment_receipt(reg: dict, ev: Optional[dict], org: Optional[dic
+     if not email:
+         return
+     title = ev.get("title") or "your NOSTOPS programme"
+-    when = " · ".join([x for x in [ev.get("event_date"), ev.get("start_time")] if x]) or "to be announced"
++    when = _when(ev, "to be announced")
+     where = ev.get("venue") or ev.get("city") or ""
+     org_name = (org or {}).get("name")
+     amt_str = _fmt_amount(reg.get("amount"), reg.get("currency")) or "—"
+@@ -4250,7 +4508,7 @@ async def _send_payment_receipt(reg: dict, ev: Optional[dict], org: Optional[dic
+ 
+ def _payment_reminder_html(reg: dict, ev: dict, org: Optional[dict]) -> str:
+     title = ev.get("title") or "your NOSTOPS programme"
+-    when = " · ".join([x for x in [ev.get("event_date"), ev.get("start_time")] if x]) or "soon"
++    when = _when(ev, "soon")
+     where = ev.get("venue") or ev.get("city") or ""
+     org_name = (org or {}).get("name")
+     amt_str = _fmt_amount(reg.get("amount"), reg.get("currency"))
+diff --git a/backend/org_enquiries.py b/backend/org_enquiries.py
+index 2e2bb54e..8540d9a4 100644
+--- a/backend/org_enquiries.py
++++ b/backend/org_enquiries.py
+@@ -420,7 +420,65 @@ async def get_enquiry(eid: str, x_pulse_secret: Optional[str] = Header(None), x_
+     doc = await _col.find_one({"_id": eid})
+     if not doc:
+         raise HTTPException(status_code=404, detail="Enquiry not found.")
+-    return _public(doc)
++    out = _public(doc)
++    if doc.get("organisation_id"):
++        import institutional as I
++        out["organisation"] = await I.org_claim_status(doc["organisation_id"])
++    return out
++
++
++# ─────────────────────── enquiry → organisation (Phase D) ───────────────────
++def _org_invite_html(doc: dict, org_name: str) -> str:
++    login = html.escape(f"{SITE}/login?next=/app/org/dashboard")
++    signup = html.escape(f"{SITE}/signup?next=/app/org/dashboard")
++    return (
++        "<div style='font-family:system-ui,sans-serif;color:#111827'>"
++        f"<h2 style='margin:0 0 8px'>Your NOSTOPS organisation is ready, {html.escape(doc['contact_name'])}</h2>"
++        f"<p style='margin:0 0 12px;color:#374151'>Following your enquiry <strong>{html.escape(doc['ref'])}</strong>, "
++        f"we have set up <strong>{html.escape(org_name)}</strong> on NOSTOPS with the details you shared.</p>"
++        f"<p style='margin:0 0 12px;color:#374151'>Sign in with <strong>{html.escape(doc['email'])}</strong> and the "
++        "organisation joins your account automatically. From there you can create your first Council-curated programme.</p>"
++        f"<p style='margin:16px 0 0'><a href='{login}' style='display:inline-block;background:#0f766e;color:#ffffff;"
++        "font-weight:700;padding:10px 18px;border-radius:8px;text-decoration:none'>Sign in to NOSTOPS &rarr;</a></p>"
++        f"<p style='margin:12px 0 0;color:#374151'>New to NOSTOPS? <a href='{signup}' style='color:#0f766e;font-weight:700'>"
++        "Create your free account</a> using the same email address.</p>"
++        "<p style='margin:16px 0 0;color:#6b7280;font-size:12px'>If you did not expect this, simply reply to this email.</p>"
++        "</div>"
++    )
++
++
++@router.post("/{eid}/create-organisation")
++async def create_organisation_from_enquiry(
++    eid: str, x_pulse_secret: Optional[str] = Header(None), x_pulse_user: Optional[str] = Header(None),
++):
++    """One click: build the Organisation from the enquiry and invite the contact
++    to sign in and take it over. Idempotent — a second call returns the same org."""
++    user = _require_admin(x_pulse_secret, x_pulse_user)
++    doc = await _col.find_one({"_id": eid})
++    if not doc:
++        raise HTTPException(status_code=404, detail="Enquiry not found.")
++    import institutional as I
++    if doc.get("organisation_id"):
++        return {"organisation": await I.org_claim_status(doc["organisation_id"]), "created": False,
++                "invite": doc.get("org_invite")}
++    if doc.get("stage") == "LOST":
++        raise HTTPException(status_code=400, detail="This enquiry is marked Lost — reopen it before creating an organisation.")
++    org = await I.create_org_from_enquiry(doc, user)
++    from email_util import send_email
++    invite = {"to": doc.get("email"), "at": _now()}
++    try:
++        await send_email(to=doc["email"], subject=f"Your NOSTOPS organisation is ready · {org['name'][:60]}",
++                         html=_org_invite_html(doc, org["name"]), reply_to=TEAM_EMAIL)
++        invite["status"] = "sent"
++    except Exception as e:  # noqa: BLE001 — the org exists; the invite can be resent manually.
++        invite.update(status="failed", error=str(getattr(e, "detail", e))[:200])
++    actor = str(user.get("name") or user.get("user_id") or "admin")[:120]
++    await _col.update_one({"_id": eid}, {
++        "$set": {"organisation_id": org["organisation_id"], "org_invite": invite, "updated_at": _now()},
++        "$push": {"history": {"action": "organisation_created", "actor": actor, "at": _now(),
++                              "to": org["organisation_id"]}},
++    })
++    return {"organisation": await I.org_claim_status(org["organisation_id"]), "created": True, "invite": invite}
+ 
+ 
+ @router.patch("/{eid}")
+diff --git a/backend/org_pricing.py b/backend/org_pricing.py
+new file mode 100644
+index 00000000..8bb88163
+--- /dev/null
++++ b/backend/org_pricing.py
+@@ -0,0 +1,45 @@
++"""Published organisation programme rates — the Python mirror of
++frontend/lib/org/pricing.ts (parity is enforced by tests/test_phase_cd_features.py).
++
++Model: a rate per participant, per session. Companies and startup / networking
++groups get commitment discounts by group size and programme length; the campus
++rate is flat. These are ESTIMATES for the organiser — final pricing is always
++confirmed by NOSTOPS.
++"""
++from typing import Optional
++
++SESSIONS_PER_MONTH = 8
++MONTH_STEPS = (1, 3, 6, 12)
++PARTICIPANT_RANGE = (15, 40)
++
++COHORT_RATES = {
++    "EDUCATIONAL_INSTITUTION": {"rate": 175, "discounted": False},
++    "COMPANY": {"rate": 300, "discounted": True},
++    "STARTUP_NETWORK": {"rate": 300, "discounted": True},
++}
++
++DISCOUNT_TIERS = [
++    {"tier": "Tier 1", "min": 15, "max": 28, "pct": {1: 0, 3: 10, 6: 12.5, 12: 15}},
++    {"tier": "Tier 2", "min": 29, "max": 40, "pct": {1: 0, 3: 20, 6: 25, 12: 30}},
++]
++
++
++def tier_for(participants: int) -> dict:
++    return DISCOUNT_TIERS[1] if participants >= DISCOUNT_TIERS[1]["min"] else DISCOUNT_TIERS[0]
++
++
++def estimate(cohort: str, months: int, participants: int, sessions: Optional[int] = None) -> dict:
++    c = COHORT_RATES[cohort]
++    sessions = SESSIONS_PER_MONTH * months if sessions is None else sessions
++    pct = tier_for(participants)["pct"][months] if c["discounted"] else 0
++    rate = c["rate"] * (100 - pct) / 100
++    per_person = rate * sessions
++    return {
++        "sessions": sessions,
++        "pct": pct,
++        "list_rate": c["rate"],
++        "rate": rate,
++        "per_person": per_person,
++        "total": per_person * participants,
++        "list_total": c["rate"] * sessions * participants,
++    }
+diff --git a/backend/tests/test_iter157_phase_cd_direct.py b/backend/tests/test_iter157_phase_cd_direct.py
+new file mode 100644
+index 00000000..84731a34
+--- /dev/null
++++ b/backend/tests/test_iter157_phase_cd_direct.py
+@@ -0,0 +1,94 @@
++"""Iter157 - direct backend sanity checks on top of test_phase_cd_features.
++Validates:
++  - public event with recurring schedule has schedule, end_date, sessions[], no price_estimate
++  - a learner (fresh email) does NOT auto-join orgs
++  - X-Pulse-User with email claims orgs created from enquiries
++  - non-admin gets 403 on create-organisation
++"""
++import base64
++import datetime as dt
++import json
++import os
++import uuid
++
++import pytest
++import requests
++from dotenv import load_dotenv
++from pymongo import MongoClient
++
++load_dotenv("/app/backend/.env")
++
++API = "http://localhost:8001/api"
++BASE = f"{API}/institutional"
++SECRET = os.environ["PULSE_SHARED_SECRET"]
++DB = MongoClient(os.environ["MONGO_URL"])[os.environ.get("DB_NAME", "nostops_web")]
++RUN = uuid.uuid4().hex[:6]
++
++
++def _h(user=None):
++    h = {"X-Pulse-Secret": SECRET, "Content-Type": "application/json"}
++    if user:
++        h["X-Pulse-User"] = base64.b64encode(json.dumps(user).encode()).decode()
++    return h
++
++
++def _future(days):
++    return (dt.date.today() + dt.timedelta(days=days)).isoformat()
++
++
++def test_recurring_public_page_hides_price_and_shows_schedule():
++    creator = {"user_id": f"qa_iter157_{RUN}", "name": "Iter157", "email": f"iter157.{RUN}@nostopsqa.com", "role": "hr"}
++    r = requests.post(f"{BASE}/organisations", headers=_h(creator), timeout=15, json={
++        "name": f"QA Iter157 Co {RUN}", "cohort_type": "COMPANY", "contact_email": "p@qa.example"})
++    assert r.status_code == 200, r.text
++    oid = r.json()["organisation"]["organisation_id"]
++    pid = next(p["programme_id"] for p in requests.get(f"{BASE}/programmes", headers=_h(), timeout=15).json()["programmes"]
++               if p["slug"] == "yoga-for-posture-back-care")
++    body = {"organisation_id": oid, "programme_id": pid, "title": f"Iter157 Rec {RUN}", "city": "Mumbai",
++            "visibility": "PUBLIC", "start_time": "07:30", "duration_minutes": 45,
++            "event_date": _future(14), "capacity": 20,
++            "schedule": {"type": "RECURRING", "weekdays": [2, 4], "months": 1}}
++    created = requests.post(f"{BASE}/events", headers=_h(creator), json=body, timeout=15)
++    assert created.status_code == 200, created.text
++    ev = created.json()["event"]
++    assert ev["price_estimate"] is not None  # organiser side has estimate
++    pub = requests.post(f"{BASE}/events/{ev['event_id']}/publish", headers=_h(creator), timeout=30)
++    assert pub.status_code == 200, pub.text
++    slug = pub.json()["event"]["slug"]
++    page = requests.get(f"{BASE}/public/events/{slug}", headers=_h(), timeout=15).json()["event"]
++    assert "price_estimate" not in page
++    assert page["schedule"]["type"] == "RECURRING" and page["schedule"]["weekdays"] == [2, 4]
++    assert page["end_date"] and page["sessions"] and len(page["sessions"]) == page["schedule"]["session_count"]
++    assert all("date" in s and "start_time" in s for s in page["sessions"])
++
++
++def test_claim_and_non_admin_guard():
++    eid = f"iter157-{uuid.uuid4().hex[:10]}"
++    DB.org_enquiries.insert_one({
++        "_id": eid, "ref": f"ENQ-ITER157-{RUN}", "organisation_name": f"TEST Iter157 Enq {RUN}",
++        "contact_name": "Iter157 QA", "designation": "Lead", "email": "delivered@resend.dev",
++        "phone": "+91 98200 11111", "cohort": "COMPANY", "city": "Mumbai", "participants": "15_28",
++        "interests": ["MIND"], "duration": "3_MONTHS", "start_period": "NEXT_MONTH", "message": None,
++        "stage": "WON", "history": [], "notes": [],
++        "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-01T00:00:00+00:00"})
++    non_admin = {"user_id": f"qa_hr_{RUN}", "name": "Not Admin", "email": "x@y.z", "role": "hr"}
++    r = requests.post(f"{API}/org-enquiries/{eid}/create-organisation", headers=_h(non_admin), timeout=15)
++    assert r.status_code == 403
++    admin = {"user_id": "qa_admin_iter157", "name": "Admin", "role": "admin"}
++    r = requests.post(f"{API}/org-enquiries/{eid}/create-organisation", headers=_h(admin), timeout=30)
++    assert r.status_code == 200
++    oid = r.json()["organisation"]["organisation_id"]
++    # Idempotent re-click
++    r2 = requests.post(f"{API}/org-enquiries/{eid}/create-organisation", headers=_h(admin), timeout=30).json()
++    assert r2["created"] is False and r2["organisation"]["organisation_id"] == oid
++    # Random email does not see it
++    other = {"user_id": f"qa_other_{RUN}", "name": "Other", "email": "other@nostopsqa.com", "role": "learner"}
++    lst = requests.get(f"{BASE}/organisations", headers=_h(other), timeout=15).json()["organisations"]
++    assert oid not in [o["organisation_id"] for o in lst]
++    # Claimant email sees it as OWNER
++    claim = {"user_id": f"qa_claim_{RUN}", "name": "QA", "email": "delivered@resend.dev", "role": "learner"}
++    lst = requests.get(f"{BASE}/organisations", headers=_h(claim), timeout=15).json()["organisations"]
++    mine = [o for o in lst if o["organisation_id"] == oid]
++    assert mine and mine[0]["my_role"] == "OWNER"
++    status = requests.get(f"{API}/org-enquiries/{eid}", headers=_h(admin), timeout=15).json()
++    assert status["organisation"]["claimed"] is True
+diff --git a/backend/tests/test_phase_cd_features.py b/backend/tests/test_phase_cd_features.py
+new file mode 100644
+index 00000000..935f29c1
+--- /dev/null
++++ b/backend/tests/test_phase_cd_features.py
+@@ -0,0 +1,245 @@
++"""Phase C/D feature tests — multi-session scheduling, organiser price estimate,
++programme suggestions (data), enquiry → organisation.
++
++Runs against the local engine on localhost:8001 with throwaway "QA PhaseCD"
++organisations / "TEST" enquiries (delivered@resend.dev — Resend's test inbox).
++Never touches real registrations or demo events.
++
++Run: cd /app/backend && python -m pytest -q tests/test_phase_cd_features.py
++"""
++import base64
++import datetime as dt
++import json
++import os
++import subprocess
++import sys
++import uuid
++
++import pytest
++import requests
++from dotenv import load_dotenv
++from pymongo import MongoClient
++
++sys.path.insert(0, "/app/backend")
++load_dotenv("/app/backend/.env")
++
++API = "http://localhost:8001/api"
++BASE = f"{API}/institutional"
++SECRET = os.environ.get("PULSE_SHARED_SECRET", "")
++DB = MongoClient(os.environ["MONGO_URL"])[os.environ.get("DB_NAME", "nostops_web")]
++RUN = uuid.uuid4().hex[:6]
++CREATOR = {"user_id": f"qa_phasecd_{RUN}", "name": "QA PhaseCD", "email": f"qa.phasecd.{RUN}@nostopsqa.com", "role": "hr"}
++ADMIN = {"user_id": "qa_admin_phasecd", "name": "QA Admin", "role": "admin"}
++
++
++def _h(user=None):
++    h = {"X-Pulse-Secret": SECRET, "Content-Type": "application/json"}
++    if user:
++        h["X-Pulse-User"] = base64.b64encode(json.dumps(user).encode()).decode()
++    return h
++
++
++def _future(days):
++    return (dt.date.today() + dt.timedelta(days=days)).isoformat()
++
++
++@pytest.fixture(scope="module")
++def org_id():
++    r = requests.post(f"{BASE}/organisations", headers=_h(CREATOR), timeout=15, json={
++        "name": f"QA PhaseCD Co {RUN}", "cohort_type": "COMPANY", "contact_email": "people@qa-phasecd.example"})
++    assert r.status_code == 200, r.text
++    return r.json()["organisation"]["organisation_id"]
++
++
++@pytest.fixture(scope="module")
++def programme_id():
++    r = requests.get(f"{BASE}/programmes", headers=_h(), timeout=15)
++    return next(p["programme_id"] for p in r.json()["programmes"] if p["slug"] == "yoga-for-posture-back-care")
++
++
++def _create(org_id, programme_id, **extra):
++    body = {"organisation_id": org_id, "programme_id": programme_id, "title": f"QA PhaseCD Programme {RUN}",
++            "city": "Mumbai", "visibility": "UNLISTED", "start_time": "07:30", "duration_minutes": 45, **extra}
++    return requests.post(f"{BASE}/events", headers=_h(CREATOR), json=body, timeout=15)
++
++
++# ── Multi-session scheduling ──────────────────────────────────────────────────
++def test_recurring_schedule_generates_sessions(org_id, programme_id):
++    start = _future(10)
++    r = _create(org_id, programme_id, event_date=start, capacity=20,
++                schedule={"type": "RECURRING", "weekdays": [2, 4], "months": 3})
++    assert r.status_code == 200, r.text
++    ev = r.json()["event"]
++    sessions = list(DB.inst_event_sessions.find({"event_id": ev["event_id"]}).sort("seq", 1))
++    assert ev["schedule"]["type"] == "RECURRING" and ev["schedule"]["session_count"] == len(sessions)
++    assert 24 <= len(sessions) <= 28  # ~13 weeks × 2
++    assert all(dt.date.fromisoformat(s["date"]).isoweekday() in (2, 4) for s in sessions)
++    assert ev["event_date"] == sessions[0]["date"] >= start
++    assert ev["end_date"] == sessions[-1]["date"]
++    assert sessions[0]["start_time"] == "07:30" and sessions[0]["duration_minutes"] == 45
++    # 3-month company programme, 20 people → Tier 1 = 10% off ₹300
++    pe = ev["price_estimate"]
++    assert pe["months"] == 3 and pe["sessions"] == len(sessions) and pe["pct"] == 10
++    assert pe["rate"] == 270 and pe["total"] == 270 * len(sessions) * 20
++
++
++def test_publish_recurring_then_public_page_lists_sessions_and_hides_estimate(org_id, programme_id):
++    ev = _create(org_id, programme_id, event_date=_future(12), capacity=30,
++                 schedule={"type": "RECURRING", "weekdays": [1, 3, 5], "months": 1}).json()["event"]
++    pub = requests.post(f"{BASE}/events/{ev['event_id']}/publish", headers=_h(CREATOR), timeout=30)
++    assert pub.status_code == 200, pub.text
++    slug = pub.json()["event"]["slug"]
++    page = requests.get(f"{BASE}/public/events/{slug}", headers=_h(), timeout=15).json()["event"]
++    assert page["schedule"]["weekdays"] == [1, 3, 5] and page["schedule"]["months"] == 1
++    assert len(page["sessions"]) == page["schedule"]["session_count"] >= 12
++    assert page["end_date"] == page["sessions"][-1]["date"]
++    assert "price_estimate" not in page  # organiser-only
++    assert page["lifecycle_effective"] == "PUBLISHED"
++
++
++def test_switching_back_to_single_clears_sessions(org_id, programme_id):
++    ev = _create(org_id, programme_id, event_date=_future(15),
++                 schedule={"type": "RECURRING", "weekdays": [6], "months": 1}).json()["event"]
++    assert DB.inst_event_sessions.count_documents({"event_id": ev["event_id"]}) >= 4
++    r = requests.patch(f"{BASE}/events/{ev['event_id']}", headers=_h(CREATOR), timeout=15,
++                       json={"schedule": {"type": "SINGLE"}, "event_date": _future(16)})
++    assert r.status_code == 200, r.text
++    out = r.json()["event"]
++    assert out["schedule"] == {"type": "SINGLE"} and out["end_date"] is None and out["event_date"] == _future(16)
++    assert DB.inst_event_sessions.count_documents({"event_id": ev["event_id"]}) == 0
++
++
++def test_patch_weekdays_regenerates_sessions(org_id, programme_id):
++    ev = _create(org_id, programme_id, event_date=_future(20),
++                 schedule={"type": "RECURRING", "weekdays": [2], "months": 1}).json()["event"]
++    n1 = DB.inst_event_sessions.count_documents({"event_id": ev["event_id"]})
++    r = requests.patch(f"{BASE}/events/{ev['event_id']}", headers=_h(CREATOR), timeout=15,
++                       json={"schedule": {"type": "RECURRING", "weekdays": [2, 4], "months": 1}})
++    assert r.status_code == 200
++    n2 = DB.inst_event_sessions.count_documents({"event_id": ev["event_id"]})
++    assert n2 > n1 and r.json()["event"]["schedule"]["session_count"] == n2
++
++
++@pytest.mark.parametrize("sched,msg", [
++    ({"type": "RECURRING", "weekdays": [], "months": 3}, "weekday"),
++    ({"type": "RECURRING", "weekdays": [1, 2, 3, 4, 5, 6], "months": 3}, "weekday"),
++    ({"type": "RECURRING", "weekdays": [8], "months": 3}, "weekday"),
++    ({"type": "RECURRING", "weekdays": [2], "months": 2}, "length"),
++])
++def test_invalid_schedules_rejected(org_id, programme_id, sched, msg):
++    r = _create(org_id, programme_id, event_date=_future(10), schedule=sched)
++    assert r.status_code == 400 and msg in r.json()["detail"].lower()
++
++
++def test_lifecycle_live_between_first_and_last_session():
++    import institutional as I
++    today = dt.date.today()
++    ev = {"lifecycle": "PUBLISHED", "event_date": (today - dt.timedelta(days=7)).isoformat(),
++          "end_date": (today + dt.timedelta(days=30)).isoformat()}
++    assert I._effective_lifecycle(ev) == "LIVE"
++    ev["end_date"] = (today - dt.timedelta(days=1)).isoformat()
++    assert I._effective_lifecycle(ev) == "COMPLETED"
++    single = {"lifecycle": "PUBLISHED", "event_date": (today - dt.timedelta(days=1)).isoformat()}
++    assert I._effective_lifecycle(single) == "COMPLETED"  # single-day behaviour unchanged
++
++
++def test_add_months_clamps_month_end():
++    import institutional as I
++    assert I._add_months(dt.date(2027, 1, 31), 1) == dt.date(2027, 2, 28)
++    assert I._add_months(dt.date(2027, 11, 15), 3) == dt.date(2028, 2, 15)
++
++
++# ── Price estimate ───────────────────────────────────────────────────────────
++def test_single_session_estimate_and_education_flat_rate(programme_id):
++    r = requests.post(f"{BASE}/organisations", headers=_h(CREATOR), timeout=15, json={
++        "name": f"QA PhaseCD Campus {RUN}", "cohort_type": "EDUCATIONAL_INSTITUTION", "contact_email": "dean@qa-phasecd.example"})
++    edu = r.json()["organisation"]["organisation_id"]
++    ev = _create(edu, programme_id, event_date=_future(9), capacity=35).json()["event"]
++    pe = ev["price_estimate"]
++    assert pe["sessions"] == 1 and pe["months"] == 1 and pe["pct"] == 0 and pe["total"] == 175 * 35
++    ev2 = _create(edu, programme_id, event_date=_future(9), capacity=35,
++                  schedule={"type": "RECURRING", "weekdays": [2, 4], "months": 12}).json()["event"]
++    assert ev2["price_estimate"]["pct"] == 0 and ev2["price_estimate"]["rate"] == 175  # flat campus rate
++
++
++def test_estimate_absent_without_capacity(org_id, programme_id):
++    ev = _create(org_id, programme_id, event_date=_future(9)).json()["event"]
++    assert ev["price_estimate"] is None
++
++
++def test_python_pricing_matches_frontend_pricing_ts():
++    import org_pricing
++    cases = [(c, m, p, s) for c in ("COMPANY", "STARTUP_NETWORK", "EDUCATIONAL_INSTITUTION")
++             for m in (1, 3, 6, 12) for p in (15, 28, 29, 40) for s in (None, 26)]
++    js = ("import { estimate } from '/app/frontend/lib/org/pricing.ts';"
++          f"const cases = {json.dumps(cases)};"
++          "console.log(JSON.stringify(cases.map(([c,m,p,s]) => s === null ? estimate(c,m,p) : estimate(c,m,p,s))));")
++    out = subprocess.run(["node", "--input-type=module", "-e", js], capture_output=True, text=True, timeout=60)
++    assert out.returncode == 0, out.stderr
++    ts = json.loads(out.stdout.strip().splitlines()[-1])
++    for (c, m, p, s), t in zip(cases, ts):
++        py = org_pricing.estimate(c, m, p, s)
++        assert py["rate"] == t["rate"] and py["pct"] == t["pct"] and py["total"] == t["total"], (c, m, p, s)
++
++
++# ── Enquiry → Organisation ───────────────────────────────────────────────────
++def _make_enquiry(**over):
++    eid = f"qa-phasecd-{uuid.uuid4().hex[:10]}"
++    doc = {"_id": eid, "ref": f"ENQ-QA-{RUN}", "organisation_name": f"TEST PhaseCD Enquiry Org {RUN}",
++           "contact_name": "Asha QA", "designation": "People Lead", "email": "delivered@resend.dev",
++           "phone": "+91 98200 12345", "cohort": "STARTUP_NETWORK", "city": "Pune", "participants": "15_28",
++           "interests": ["MIND"], "duration": "3_MONTHS", "start_period": "NEXT_MONTH", "message": None,
++           "stage": "WON", "history": [], "notes": [], "created_at": "2026-01-01T00:00:00+00:00",
++           "updated_at": "2026-01-01T00:00:00+00:00", **over}
++    DB.org_enquiries.insert_one(doc)
++    return eid
++
++
++def test_enquiry_to_organisation_and_claim_on_first_sign_in():
++    eid = _make_enquiry()
++    r = requests.post(f"{API}/org-enquiries/{eid}/create-organisation", headers=_h(ADMIN), timeout=30)
++    assert r.status_code == 200, r.text
++    body = r.json()
++    assert body["created"] is True and body["organisation"]["claimed"] is False
++    oid = body["organisation"]["organisation_id"]
++    org = DB.inst_organisations.find_one({"organisation_id": oid})
++    assert org["name"] == f"TEST PhaseCD Enquiry Org {RUN}" and org["cohort_type"] == "STARTUP_NETWORK"
++    assert org["primary_city"] == "Pune" and org["contact_person"] == "Asha QA" and org["contact_phone"] == "+91 98200 12345"
++    assert org["pending_owner_email"] == "delivered@resend.dev"
++    assert DB.inst_org_members.count_documents({"organisation_id": oid}) == 0
++    assert body["invite"]["to"] == "delivered@resend.dev" and body["invite"]["status"] in ("sent", "failed")
++    # Idempotent second click.
++    again = requests.post(f"{API}/org-enquiries/{eid}/create-organisation", headers=_h(ADMIN), timeout=30).json()
++    assert again["created"] is False and again["organisation"]["organisation_id"] == oid
++    # A different user does NOT get it.
++    other = {"user_id": f"qa_other_{RUN}", "name": "Other", "email": "someone.else@nostopsqa.com", "role": "learner"}
++    lst = requests.get(f"{BASE}/organisations", headers=_h(other), timeout=15).json()["organisations"]
++    assert oid not in [o["organisation_id"] for o in lst]
++    # First signed-in visit by the contact email → joined as OWNER.
++    contact = {"user_id": f"qa_contact_{RUN}", "name": "Asha QA", "email": "Delivered@Resend.dev", "role": "learner"}
++    lst = requests.get(f"{BASE}/organisations", headers=_h(contact), timeout=15).json()["organisations"]
++    mine = [o for o in lst if o["organisation_id"] == oid]
++    assert mine and mine[0]["my_role"] == "OWNER"
++    status = requests.get(f"{API}/org-enquiries/{eid}", headers=_h(ADMIN), timeout=15).json()
++    assert status["organisation"]["claimed"] is True and status["organisation_id"] == oid
++    # Claimed once only — a later different account with the same email does not double-claim.
++    dup = {**contact, "user_id": f"qa_contact2_{RUN}"}
++    lst2 = requests.get(f"{BASE}/organisations", headers=_h(dup), timeout=15).json()["organisations"]
++    assert oid not in [o["organisation_id"] for o in lst2]
++    # The new owner can create a programme for it.
++    pid = requests.get(f"{BASE}/programmes", headers=_h(), timeout=15).json()["programmes"][0]["programme_id"]
++    ev = requests.post(f"{BASE}/events", headers=_h(contact), timeout=15, json={
++        "organisation_id": oid, "programme_id": pid, "title": "QA PhaseCD claimed org programme"})
++    assert ev.status_code == 200, ev.text
++
++
++def test_enquiry_to_org_guards():
++    lost = _make_enquiry(stage="LOST")
++    r = requests.post(f"{API}/org-enquiries/{lost}/create-organisation", headers=_h(ADMIN), timeout=15)
++    assert r.status_code == 400
++    noemail = _make_enquiry(email=None)
++    r = requests.post(f"{API}/org-enquiries/{noemail}/create-organisation", headers=_h(ADMIN), timeout=15)
++    assert r.status_code == 400
++    ok = _make_enquiry()
++    r = requests.post(f"{API}/org-enquiries/{ok}/create-organisation", headers=_h(CREATOR), timeout=15)
++    assert r.status_code == 403  # admins only
+diff --git a/frontend/app/(public)/events/[slug]/page.tsx b/frontend/app/(public)/events/[slug]/page.tsx
+index 49f069ba..2ba3ca97 100644
+--- a/frontend/app/(public)/events/[slug]/page.tsx
++++ b/frontend/app/(public)/events/[slug]/page.tsx
+@@ -5,6 +5,7 @@ import { canonical } from '@/lib/site';
+ import { JsonLd } from '@/components/JsonLd';
+ import ShareBar from '@/components/app/org/events/ShareBar';
+ import { getPublicEvent } from '@/lib/server/institutional';
++import { formatDate, weekdayList } from '@/lib/org/schedule';
+ 
+ export const dynamic = 'force-dynamic';
+ 
+@@ -76,6 +77,7 @@ export default async function PublicEventPage({ params }: Params) {
+     name: ev.title,
+     description: ev.subtitle || ev.programme?.essence || '',
+     startDate,
++    ...(ev.end_date ? { endDate: ev.end_date } : {}),
+     eventStatus: 'https://schema.org/EventScheduled',
+     eventAttendanceMode: 'https://schema.org/OfflineEventAttendanceMode',
+     inLanguage: ev.language || undefined,
+@@ -173,7 +175,12 @@ export default async function PublicEventPage({ params }: Params) {
+           <div className="space-y-6">
+             {/* Facts */}
+             <div className="grid gap-4 rounded-2xl border border-line bg-white p-5 sm:grid-cols-2">
+-              <Detail icon="📅" title={ev.event_date || 'Date to be announced'} sub={[ev.start_time, ev.end_time].filter(Boolean).join(' – ') + (ev.timezone ? ` · ${ev.timezone.replace('_', ' ')}` : '')} />
++              {ev.schedule ? (
++                <Detail icon="📅" title={`${formatDate(ev.event_date)} – ${formatDate(ev.end_date)}`}
++                  sub={`${ev.schedule.session_count} sessions · every ${weekdayList(ev.schedule.weekdays)}${ev.start_time ? ` · ${ev.start_time}` : ''}`} />
++              ) : (
++                <Detail icon="📅" title={ev.event_date || 'Date to be announced'} sub={[ev.start_time, ev.end_time].filter(Boolean).join(' – ') + (ev.timezone ? ` · ${ev.timezone.replace('_', ' ')}` : '')} />
++              )}
+               <Detail icon="⏱" title={ev.duration_minutes ? `${ev.duration_minutes} minutes` : 'Duration TBC'} sub="Session duration" />
+               <Detail icon="📍" title={ev.venue || ev.city || '—'} sub={ev.community_space_contribution ? `Community space · ${ev.city || ''}`.trim() : (ev.city || undefined)} />
+               <Detail icon="👥" title={ev.capacity ? `${ev.capacity} participants` : 'Open capacity'} sub="Participant capacity" />
+@@ -182,6 +189,28 @@ export default async function PublicEventPage({ params }: Params) {
+               {ev.registration_closing_date && <Detail icon="📝" title={ev.registration_closing_date} sub="Registration closes" />}
+             </div>
+ 
++            {/* Multi-session programme schedule (Phase C) */}
++            {ev.schedule && ev.sessions?.length ? (
++              <section id="schedule" data-testid="event-schedule">
++                <h2 className="text-lg font-black text-ink">Programme schedule</h2>
++                <p className="mt-2 text-sm text-ink-soft">
++                  {ev.schedule.session_count} sessions, every {weekdayList(ev.schedule.weekdays)} for {ev.schedule.months} month{ev.schedule.months === 1 ? '' : 's'}
++                  {ev.start_time ? ` at ${ev.start_time}` : ''}{ev.duration_minutes ? ` (${ev.duration_minutes} min)` : ''}.{' '}
++                  <span className="font-semibold text-ink">One registration covers every session.</span>
++                </p>
++                <details className="mt-3 rounded-2xl border border-line bg-white p-4">
++                  <summary className="cursor-pointer text-sm font-bold text-brand-700" data-testid="event-schedule-toggle">See all {ev.sessions.length} session dates</summary>
++                  <ol className="mt-3 grid gap-1.5 p-0 sm:grid-cols-2" data-testid="event-schedule-list">
++                    {ev.sessions.map((s) => (
++                      <li key={s.seq} className="flex items-center gap-2 text-sm text-ink-soft">
++                        <span className="w-7 text-right text-xs font-bold text-muted">{s.seq}.</span>{formatDate(s.date, true)}
++                      </li>
++                    ))}
++                  </ol>
++                </details>
++              </section>
++            ) : null}
++
+             {/* About this event */}
+             <section id="about">
+               <h2 className="text-lg font-black text-ink">About this Event</h2>
+diff --git a/frontend/app/app/admin/org-enquiries/[id]/page.tsx b/frontend/app/app/admin/org-enquiries/[id]/page.tsx
+index 99eeae00..82959020 100644
+--- a/frontend/app/app/admin/org-enquiries/[id]/page.tsx
++++ b/frontend/app/app/admin/org-enquiries/[id]/page.tsx
+@@ -7,6 +7,7 @@ import { DURATIONS, ENQ_COHORTS, INTERESTS, PARTICIPANT_LABELS, START_PERIODS, l
+ import OrgEnquiryEditor from '@/components/app/admin/OrgEnquiryEditor';
+ import ProposalComposer from '@/components/app/admin/ProposalComposer';
+ import DeleteEnquiry from '@/components/app/admin/DeleteEnquiry';
++import CreateOrgFromEnquiry from '@/components/app/admin/CreateOrgFromEnquiry';
+ 
+ export const dynamic = 'force-dynamic';
+ export const metadata: Metadata = { title: 'Admin · Org Enquiry', robots: { index: false, follow: false } };
+@@ -60,6 +61,7 @@ export default async function AdminOrgEnquiryPage({ params }: { params: Promise<
+               <p className="mt-1 whitespace-pre-wrap text-sm text-ink-soft" data-testid="enq-detail-message">{e.message}</p>
+             </div>
+           )}
++          <CreateOrgFromEnquiry key={`org-${e.updated_at}`} e={e} />
+           <ProposalComposer enquiry={e} />
+           <DeleteEnquiry id={e.id} enquiryRef={e.ref} />
+         </div>
+diff --git a/frontend/app/bff/admin/org-enquiries/[id]/create-organisation/route.ts b/frontend/app/bff/admin/org-enquiries/[id]/create-organisation/route.ts
+new file mode 100644
+index 00000000..351d608d
+--- /dev/null
++++ b/frontend/app/bff/admin/org-enquiries/[id]/create-organisation/route.ts
+@@ -0,0 +1,21 @@
++// Admin — turn an organisation enquiry into a ready Organisation (Phase D) and
++// email the contact an invitation to sign in and take it over. Admin + CSRF.
++import type { NextRequest } from 'next/server';
++import { NextResponse } from 'next/server';
++import { requireAdmin } from '@/lib/server/admin-guard';
++import { toErrorText } from '@/lib/server/bff';
++import { orgEnquiryFetch } from '@/lib/server/org-enquiries';
++
++export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
++  const guard = await requireAdmin(req);
++  if (!guard.ok) return guard.res;
++  const { id } = await params;
++  try {
++    const up = await orgEnquiryFetch(`/${encodeURIComponent(id)}/create-organisation`, guard.user, { method: 'POST', body: '{}' });
++    const data = await up.json().catch(() => ({}));
++    if (!up.ok) return NextResponse.json({ error: toErrorText(data?.detail, 'Could not create the organisation.') }, { status: up.status });
++    return NextResponse.json(data);
++  } catch {
++    return NextResponse.json({ error: 'Enquiry service unavailable.' }, { status: 504 });
++  }
++}
+diff --git a/frontend/components/app/admin/CreateOrgFromEnquiry.tsx b/frontend/components/app/admin/CreateOrgFromEnquiry.tsx
+new file mode 100644
+index 00000000..62383cb1
+--- /dev/null
++++ b/frontend/components/app/admin/CreateOrgFromEnquiry.tsx
+@@ -0,0 +1,56 @@
++'use client';
++// Admin enquiry → Organisation (Phase D). One click builds the organisation from
++// the enquiry; it joins the contact's account the first time they sign in with
++// the enquiry email.
++import { useState } from 'react';
++import { useRouter } from 'next/navigation';
++import { postBff } from '@/lib/auth-client';
++import type { OrgEnquiry } from '@/lib/server/org-enquiries';
++
++export default function CreateOrgFromEnquiry({ e }: { e: OrgEnquiry }) {
++  const router = useRouter();
++  const [busy, setBusy] = useState(false);
++  const [err, setErr] = useState('');
++  const org = e.organisation;
++  const blocked = e.stage === 'LOST' ? 'Reopen this Lost enquiry to create an organisation.' : !e.email ? 'Add a contact email first — the invitation goes there.' : '';
++
++  async function create() {
++    setErr(''); setBusy(true);
++    const res = await postBff(`/bff/admin/org-enquiries/${e.id}/create-organisation`);
++    setBusy(false);
++    if (!res.ok) { setErr(res.data?.error || 'Could not create the organisation.'); return; }
++    router.refresh();
++  }
++
++  return (
++    <div className="rounded-2xl border border-line bg-white p-5" data-testid="enq-org-card">
++      <p className="text-xs font-black uppercase tracking-wide text-muted">Organisation</p>
++      {org ? (
++        <div className="mt-2 space-y-1 text-sm">
++          <p className="font-bold text-ink" data-testid="enq-org-name">✓ {org.name} <span className="font-semibold text-muted">· {org.organisation_id}</span></p>
++          {org.claimed ? (
++            <p className="font-semibold text-emerald-700" data-testid="enq-org-claimed">Joined by {org.pending_owner_email} on {(org.claimed_at || '').slice(0, 10)}</p>
++          ) : (
++            <p className="text-amber-700" data-testid="enq-org-pending">Waiting for {org.pending_owner_email} to sign in — it joins their account automatically.</p>
++          )}
++          {e.org_invite && (
++            <p className="text-xs text-muted" data-testid="enq-org-invite">
++              Invitation email {e.org_invite.status === 'sent' ? 'sent' : 'failed'} to {e.org_invite.to} · {(e.org_invite.at || '').replace('T', ' ').slice(0, 16)}
++              {e.org_invite.status !== 'sent' && e.org_invite.error ? ` (${e.org_invite.error})` : ''}
++            </p>
++          )}
++        </div>
++      ) : (
++        <>
++          <p className="mt-1 text-sm text-ink-soft">Create the organisation from this enquiry (name, type, city and contact). {e.contact_name} gets an email to sign in with {e.email || 'their email'} and take it over.</p>
++          {blocked && <p className="mt-2 text-xs font-semibold text-amber-700">{blocked}</p>}
++          {err && <p className="mt-2 text-xs font-semibold text-rose-600" data-testid="enq-org-error">{err}</p>}
++          <button type="button" onClick={create} disabled={busy || !!blocked} data-testid="enq-create-org"
++            className="mt-3 inline-flex min-h-[44px] items-center rounded-xl bg-brand px-4 py-2 text-sm font-bold text-white transition hover:bg-brand-600 disabled:opacity-50">
++            {busy ? 'Creating…' : 'Create organisation & invite contact'}
++          </button>
++        </>
++      )}
++    </div>
++  );
++}
+diff --git a/frontend/components/app/org/events/EventCreatorWizard.tsx b/frontend/components/app/org/events/EventCreatorWizard.tsx
+index f310b91c..261c42bc 100644
+--- a/frontend/components/app/org/events/EventCreatorWizard.tsx
++++ b/frontend/components/app/org/events/EventCreatorWizard.tsx
+@@ -7,9 +7,13 @@
+ import { useEffect, useMemo, useState, type ReactNode } from 'react';
+ import { useRouter } from 'next/navigation';
+ import { postBff, sendBff } from '@/lib/auth-client';
++import { formatDate, sessionDates, weekdayList, type ScheduleValue } from '@/lib/org/schedule';
++import ProgrammeSuggestions from '@/components/app/org/events/ProgrammeSuggestions';
++import PriceEstimate from '@/components/app/org/events/PriceEstimate';
++import ScheduleBuilder from '@/components/app/org/events/ScheduleBuilder';
+ 
+ type Prog = {
+-  programme_id: string; name: string; taxonomy: string; taxonomy_label: string;
++  programme_id: string; name: string; slug?: string | null; taxonomy: string; taxonomy_label: string;
+   essence: string; objectives: string[]; level: string; default_duration_minutes: number;
+   recommended_audience?: string[]; recommended_group_size?: string | null;
+   recommended_frequency?: string | null; recommended_duration_label?: string | null;
+@@ -50,6 +54,7 @@ type InstEventLike = {
+   venue?: string | null; venue_type?: string | null; external_venue_cost?: number | null; capacity?: number | null;
+   language?: string | null; registration_closing_date?: string | null; visibility?: string;
+   registration_access?: string;
++  schedule?: { type?: string; weekdays?: number[]; months?: number; start_date?: string | null } | null;
+   programme_champion?: { member_id?: string } | null; lifecycle?: string;
+ };
+ 
+@@ -162,7 +167,7 @@ export default function EventCreatorWizard(props: WizardProps) {
+   const [previewProg, setPreviewProg] = useState<Prog | null>(null);
+   const [members, setMembers] = useState<Member[]>([]);
+   const [cfg, setCfg] = useState({
+-    title: ie?.title || '', subtitle: ie?.subtitle || '', date: ie?.event_date || '', startTime: ie?.start_time || '',
++    title: ie?.title || '', subtitle: ie?.subtitle || '', date: ie?.schedule?.start_date || ie?.event_date || '', startTime: ie?.start_time || '',
+     endTime: ie?.end_time || '', duration: String(ie?.duration_minutes || 60), timezone: ie?.timezone || props.defaultTimezone || 'Asia/Kolkata',
+     city: ie?.city || '', venue: ie?.venue || '', venueType: ie?.venue_type || 'EXISTING_SPACE',
+     externalVenueCost: ie?.external_venue_cost != null ? String(ie.external_venue_cost) : '',
+@@ -171,6 +176,17 @@ export default function EventCreatorWizard(props: WizardProps) {
+     regAccess: ie?.registration_access || 'OPEN',
+     championMemberId: ie?.programme_champion?.member_id || '',
+   });
++  // Phase C — single session or a repeating programme (one registration covers all sessions).
++  const [schedule, setSchedule] = useState<ScheduleValue>({
++    type: ie?.schedule?.type === 'RECURRING' ? 'RECURRING' : 'SINGLE',
++    weekdays: ie?.schedule?.weekdays?.length ? ie.schedule.weekdays : [2, 4],
++    months: ie?.schedule?.months || 3,
++  });
++  const recurring = schedule.type === 'RECURRING';
++  const sessionList = useMemo(() => (recurring ? sessionDates(cfg.date, schedule.weekdays, schedule.months) : []), [recurring, cfg.date, schedule]);
++  const estMonths = recurring ? schedule.months : 1;
++  const estSessions = recurring ? sessionList.length || schedule.months * 8 : 1;
++  const scheduleBody = recurring ? schedule : { type: 'SINGLE' };
+   const [eventId, setEventId] = useState<string>(ie?.event_id || '');
+   const [published, setPublished] = useState<{ path: string | null; indexable: boolean } | null>(null);
+   // A logo chosen before the organisation exists is held here (already resized)
+@@ -218,6 +234,7 @@ export default function EventCreatorWizard(props: WizardProps) {
+       registration_closing_date: cfg.regClose || undefined, visibility: cfg.visibility,
+       registration_access: cfg.regAccess,
+       programme_champion_member_id: cfg.championMemberId || undefined,
++      schedule: scheduleBody,
+     };
+     try {
+       const res = eventId
+@@ -315,7 +332,9 @@ export default function EventCreatorWizard(props: WizardProps) {
+     setErr('');
+     if (!programme) { setErr('Please choose a programme.'); return; }
+     if (cfg.title.trim().length < 3) { setErr('Please enter an event title.'); return; }
+-    if (!cfg.date) { setErr('Please pick a date.'); return; }
++    if (!cfg.date) { setErr(recurring ? 'Please pick a start date.' : 'Please pick a date.'); return; }
++    if (recurring && !schedule.weekdays.length) { setErr('Choose at least one weekday for your repeating programme.'); return; }
++    if (recurring && !sessionList.length) { setErr('This schedule has no sessions — check the start date and weekdays.'); return; }
+     if (!cfg.city) { setErr('Please choose a city.'); return; }
+     if (cfg.regClose && cfg.date && cfg.regClose > cfg.date) {
+       setErr('Registration closing date cannot be after the event date.'); return;
+@@ -334,6 +353,7 @@ export default function EventCreatorWizard(props: WizardProps) {
+       registration_closing_date: cfg.regClose || undefined, visibility: cfg.visibility,
+       registration_access: cfg.regAccess,
+       programme_champion_member_id: cfg.championMemberId || undefined,
++      schedule: scheduleBody,
+     };
+     try {
+       const res = eventId
+@@ -503,6 +523,17 @@ export default function EventCreatorWizard(props: WizardProps) {
+             />
+           </div>
+ 
++          {/* Phase D — fixed suggestions for this organisation type */}
++          {!progQuery.trim() && (
++            <ProgrammeSuggestions
++              cohort={cohort}
++              programmes={allProgs}
++              selectedId={programme?.programme_id}
++              onSelect={chooseProgramme}
++              onPreview={(p) => setPreviewProg(p)}
++            />
++          )}
++
+           {/* Taxonomy filter — hidden while searching across all categories */}
+           {!progQuery.trim() && (
+             <div className="mt-3 flex gap-2 rounded-xl bg-cream p-1">
+@@ -589,8 +620,10 @@ export default function EventCreatorWizard(props: WizardProps) {
+             <div className="grid gap-4">
+               <div><label className={label}>Event Title *</label><input className={input} value={cfg.title} onChange={(e) => setCfg({ ...cfg, title: e.target.value })} data-testid="cfg-title" /></div>
+ 
++              <ScheduleBuilder value={schedule} onChange={setSchedule} dates={sessionList} startDate={cfg.date} />
++
+               <div className="grid gap-4 sm:grid-cols-2">
+-                <div><label className={label}>Date *</label><input type="date" className={input} value={cfg.date} onChange={(e) => setCfg({ ...cfg, date: e.target.value })} data-testid="cfg-date" /></div>
++                <div><label className={label}>{recurring ? 'Start date *' : 'Date *'}</label><input type="date" className={input} value={cfg.date} onChange={(e) => setCfg({ ...cfg, date: e.target.value })} data-testid="cfg-date" /></div>
+                 <div><label className={label}>Timezone</label>
+                   <select className={input} value={cfg.timezone} onChange={(e) => setCfg({ ...cfg, timezone: e.target.value })} data-testid="cfg-timezone">
+                     {props.timezones.map((tz) => <option key={tz} value={tz}>{tz.replace('_', ' ')}</option>)}
+@@ -612,7 +645,7 @@ export default function EventCreatorWizard(props: WizardProps) {
+                 </div>
+                 <div><label className={label}>Participant Capacity</label>
+                   <input type="number" min={1} className={input} value={cfg.capacity} onChange={(e) => setCfg({ ...cfg, capacity: e.target.value })} data-testid="cfg-capacity" placeholder="e.g. 25" />
+-                  <p className="mt-1 text-[11px] text-muted">Group size is configurable and affects programme economics.</p>
++                  <p className="mt-1 text-[11px] text-muted">Group size is configurable and drives your price estimate.</p>
+                 </div>
+               </div>
+ 
+@@ -657,6 +690,8 @@ export default function EventCreatorWizard(props: WizardProps) {
+             </div>
+ 
+             <div className="grid content-start gap-4">
++              <PriceEstimate cohort={cohort} participants={Number(cfg.capacity) > 0 ? Number(cfg.capacity) : null} months={estMonths} sessions={estSessions} />
++
+               <div className="rounded-2xl border border-line bg-cream p-4">
+                 <p className={label}>Event Visibility</p>
+                 <div className="mt-2 grid gap-2">
+@@ -747,7 +782,12 @@ export default function EventCreatorWizard(props: WizardProps) {
+             </div>
+ 
+             <div className="mt-4 grid gap-3 sm:grid-cols-2">
+-              <Detail icon="📅" title={cfg.date} sub={[cfg.startTime, cfg.endTime].filter(Boolean).join(' – ') + (cfg.timezone ? ` · ${cfg.timezone.replace('_', ' ')}` : '')} />
++              {recurring && sessionList.length ? (
++                <Detail icon="📅" title={`${sessionList.length} sessions · every ${weekdayList(schedule.weekdays)}`}
++                  sub={`${formatDate(sessionList[0])} → ${formatDate(sessionList[sessionList.length - 1])}${cfg.startTime ? ` · ${cfg.startTime}` : ''} · one registration covers all sessions`} />
++              ) : (
++                <Detail icon="📅" title={cfg.date} sub={[cfg.startTime, cfg.endTime].filter(Boolean).join(' – ') + (cfg.timezone ? ` · ${cfg.timezone.replace('_', ' ')}` : '')} />
++              )}
+               <Detail icon="📍" title={cfg.venue || cfg.city} sub={cfg.venueType === 'EXTERNAL_VENUE' ? `External venue · ${cfg.city}${cfg.externalVenueCost ? ` · ₹${cfg.externalVenueCost}` : ''}` : `Community Space Contribution · ${cfg.city}`} />
+               <Detail icon="👥" title={cfg.capacity ? `${cfg.capacity} participants` : 'Open capacity'} sub="" />
+               <Detail icon="⏱" title={`${cfg.duration} minutes`} sub={cfg.language} />
+@@ -759,6 +799,9 @@ export default function EventCreatorWizard(props: WizardProps) {
+               <p className={label}>About the Programme (Council content · cannot be edited)</p>
+               <p className="mt-1 text-sm text-ink-soft">{programme.essence}</p>
+             </div>
++            <div className="mt-4">
++              <PriceEstimate cohort={cohort} participants={Number(cfg.capacity) > 0 ? Number(cfg.capacity) : null} months={estMonths} sessions={estSessions} />
++            </div>
+           </div>
+           <div className="mt-6 flex items-center justify-between">
+             <button type="button" className={ghostBtn} onClick={() => setPhase(2)}>← Back</button>
+diff --git a/frontend/components/app/org/events/PriceEstimate.tsx b/frontend/components/app/org/events/PriceEstimate.tsx
+new file mode 100644
+index 00000000..af73e663
+--- /dev/null
++++ b/frontend/components/app/org/events/PriceEstimate.tsx
+@@ -0,0 +1,51 @@
++// Organiser-only price estimate (Phase C) from the published organisation rates
++// (lib/org/pricing.ts). The backend saves the same figures with the event.
++import type { CohortKey } from '@/lib/org/cohort-copy';
++import { COHORT_RATES, PARTICIPANT_RANGE, estimate, inr, inrRate, type Months } from '@/lib/org/pricing';
++
++export default function PriceEstimate({ cohort, participants, months, sessions }: {
++  cohort: string;
++  participants: number | null;
++  months: number;
++  sessions: number;
++}) {
++  if (!(cohort in COHORT_RATES)) return null;
++  const c = COHORT_RATES[cohort as CohortKey];
++  const e = participants ? estimate(cohort as CohortKey, months as Months, participants, sessions) : null;
++  const outside = !!participants && (participants < PARTICIPANT_RANGE.min || participants > PARTICIPANT_RANGE.max);
++  return (
++    <div className="rounded-2xl border border-brand/30 bg-brand-50/60 p-4" data-testid="price-estimate">
++      <p className="text-xs font-bold uppercase tracking-wider text-muted">Price estimate <span className="normal-case tracking-normal">· only you see this</span></p>
++      {!e ? (
++        <p className="mt-2 text-xs text-ink-soft" data-testid="price-estimate-empty">Add your expected number of participants (capacity) to see an estimate.</p>
++      ) : (
++        <>
++          <p className="mt-2 text-2xl font-black text-ink" data-testid="price-estimate-total">{inr(e.total)}</p>
++          <p className="text-xs text-ink-soft">for {participants} {c.people} · {sessions} session{sessions === 1 ? '' : 's'}</p>
++          <dl className="mt-3 space-y-1 text-xs">
++            <div className="flex justify-between gap-2">
++              <dt className="text-muted">Per participant, per session</dt>
++              <dd className="font-bold text-ink" data-testid="price-estimate-rate">
++                {e.pct ? <s className="mr-1 font-normal text-muted">{inrRate(e.listRate)}</s> : null}{inrRate(e.rate)}
++              </dd>
++            </div>
++            <div className="flex justify-between gap-2">
++              <dt className="text-muted">{c.discounted ? 'Commitment discount' : 'Campus rate'}</dt>
++              <dd className="font-bold text-ink" data-testid="price-estimate-discount">{c.discounted ? (e.pct ? `${e.pct}%` : 'None for 1 month') : 'Flat · no discounts'}</dd>
++            </div>
++            <div className="flex justify-between gap-2">
++              <dt className="text-muted">Per participant, whole programme</dt>
++              <dd className="font-bold text-ink">{inr(e.perPerson)}</dd>
++            </div>
++          </dl>
++          {outside && (
++            <p className="mt-2 text-[11px] font-semibold text-amber-700" data-testid="price-estimate-range">
++              Published rates cover groups of {PARTICIPANT_RANGE.min}–{PARTICIPANT_RANGE.max}; NOSTOPS will confirm pricing for your group size.
++            </p>
++          )}
++        </>
++      )}
++      <p className="mt-2 text-[11px] text-muted">Based on NOSTOPS published organisation rates. Final pricing is confirmed by NOSTOPS; participants never see this estimate.</p>
++    </div>
++  );
++}
+diff --git a/frontend/components/app/org/events/ProgrammeSuggestions.tsx b/frontend/components/app/org/events/ProgrammeSuggestions.tsx
+new file mode 100644
+index 00000000..38489c80
+--- /dev/null
++++ b/frontend/components/app/org/events/ProgrammeSuggestions.tsx
+@@ -0,0 +1,48 @@
++// Programme suggestions for the organisation type (Phase D) — a compact list at
++// the top of the Event Creator's Programme step.
++import { recommendedFor } from '@/lib/org/recommendations';
++
++type P = { programme_id: string; name: string; slug?: string | null; taxonomy_label: string };
++
++const AUDIENCE: Record<string, string> = {
++  COMPANY: 'companies', EDUCATIONAL_INSTITUTION: 'schools, colleges and universities', STARTUP_NETWORK: 'startup & networking groups',
++};
++
++export default function ProgrammeSuggestions<T extends P>({ cohort, programmes, selectedId, onSelect, onPreview }: {
++  cohort: string;
++  programmes: T[];
++  selectedId?: string;
++  onSelect: (p: T) => void;
++  onPreview: (p: T) => void;
++}) {
++  const recs = recommendedFor(cohort, programmes);
++  if (!recs.length) return null;
++  return (
++    <section className="mt-4 rounded-2xl border border-brand/30 bg-brand-50/50 p-4" data-testid="prog-recommended">
++      <p className="text-sm font-black text-ink">⭐ Recommended for your organisation</p>
++      <p className="mt-0.5 text-xs text-ink-soft">
++        Popular picks for {AUDIENCE[cohort] || 'organisations like yours'} — you can still choose any programme below.
++      </p>
++      <ul className="mt-3 space-y-2 p-0">
++        {recs.map(({ prog, reason }) => {
++          const sel = selectedId === prog.programme_id;
++          return (
++            <li key={prog.programme_id} data-testid={`rec-${prog.slug}`}
++              className={`flex flex-col gap-2 rounded-xl border bg-white p-3 sm:flex-row sm:items-center ${sel ? 'border-brand ring-1 ring-brand' : 'border-line'}`}>
++              <div className="min-w-0 flex-1">
++                <p className="text-sm font-extrabold text-ink">{prog.name} <span className="ml-1 rounded-full bg-cream px-2 py-0.5 text-[10px] font-bold text-ink-soft">{prog.taxonomy_label}</span></p>
++                <p className="mt-0.5 text-xs text-ink-soft">{reason}</p>
++              </div>
++              <div className="flex shrink-0 gap-2">
++                <button type="button" onClick={() => onPreview(prog)} data-testid={`rec-preview-${prog.slug}`}
++                  className="min-h-[40px] rounded-lg border border-line bg-white px-3 text-xs font-bold text-ink-soft hover:bg-cream">Preview</button>
++                <button type="button" onClick={() => onSelect(prog)} data-testid={`rec-select-${prog.slug}`}
++                  className={`min-h-[40px] rounded-lg px-3 text-xs font-bold text-white ${sel ? 'bg-emerald-600' : 'bg-brand hover:bg-brand-600'}`}>{sel ? 'Selected ✓' : 'Select'}</button>
++              </div>
++            </li>
++          );
++        })}
++      </ul>
++    </section>
++  );
++}
+diff --git a/frontend/components/app/org/events/ScheduleBuilder.tsx b/frontend/components/app/org/events/ScheduleBuilder.tsx
+new file mode 100644
+index 00000000..21cf6c61
+--- /dev/null
++++ b/frontend/components/app/org/events/ScheduleBuilder.tsx
+@@ -0,0 +1,76 @@
++// Single session vs repeating programme (Phase C). A repeating programme runs on
++// the chosen weekdays from the start date for 1/3/6/12 months; participants
++// register once for the whole series.
++import { MAX_WEEKDAYS, SCHEDULE_MONTHS, WEEKDAYS, formatDate, weekdayList, type ScheduleValue } from '@/lib/org/schedule';
++
++const PREVIEW = 6;
++
++export default function ScheduleBuilder({ value, onChange, dates, startDate }: {
++  value: ScheduleValue;
++  onChange: (v: ScheduleValue) => void;
++  dates: string[];
++  startDate: string;
++}) {
++  const recurring = value.type === 'RECURRING';
++  const toggleDay = (n: number) => {
++    const has = value.weekdays.includes(n);
++    if (!has && value.weekdays.length >= MAX_WEEKDAYS) return;
++    onChange({ ...value, weekdays: has ? value.weekdays.filter((d) => d !== n) : [...value.weekdays, n].sort((a, b) => a - b) });
++  };
++  const seg = (on: boolean) => `flex-1 rounded-lg px-3 py-2 text-sm font-bold transition ${on ? 'bg-white text-brand-700 shadow-sm' : 'text-muted'}`;
++
++  return (
++    <div className="rounded-2xl border border-line bg-cream/50 p-4" data-testid="schedule-builder">
++      <p className="text-xs font-bold uppercase tracking-wider text-muted">Schedule</p>
++      <div className="mt-2 flex gap-2 rounded-xl bg-cream p-1">
++        <button type="button" className={seg(!recurring)} onClick={() => onChange({ ...value, type: 'SINGLE' })} data-testid="sched-single" aria-pressed={!recurring}>Single session</button>
++        <button type="button" className={seg(recurring)} onClick={() => onChange({ ...value, type: 'RECURRING' })} data-testid="sched-recurring" aria-pressed={recurring}>Repeating programme</button>
++      </div>
++
++      {recurring && (
++        <div className="mt-3 space-y-3">
++          <div>
++            <p className="text-xs font-semibold text-ink-soft">Repeats every</p>
++            <div className="mt-1.5 flex flex-wrap gap-1.5">
++              {WEEKDAYS.map((d) => {
++                const on = value.weekdays.includes(d.n);
++                return (
++                  <button key={d.n} type="button" onClick={() => toggleDay(d.n)} aria-pressed={on} data-testid={`sched-day-${d.n}`}
++                    className={`min-h-[40px] min-w-[48px] rounded-lg border px-2 text-xs font-bold transition ${on ? 'border-brand bg-brand text-white' : 'border-line bg-white text-ink-soft'}`}>
++                    {d.short}
++                  </button>
++                );
++              })}
++            </div>
++            <p className="mt-1 text-[11px] text-muted">Our published plans run 2 sessions a week · up to {MAX_WEEKDAYS} days.</p>
++          </div>
++          <div>
++            <label className="text-xs font-semibold text-ink-soft" htmlFor="sched-months">Programme length</label>
++            <select id="sched-months" value={value.months} onChange={(e) => onChange({ ...value, months: Number(e.target.value) })} data-testid="sched-months"
++              className="mt-1 w-full rounded-xl border border-line bg-white px-3 py-2.5 text-sm text-ink outline-none focus:border-brand">
++              {SCHEDULE_MONTHS.map((m) => <option key={m} value={m}>{m} month{m === 1 ? '' : 's'}</option>)}
++            </select>
++          </div>
++          <div className="rounded-xl bg-white p-3 text-sm" data-testid="sched-preview">
++            {!startDate ? (
++              <p className="text-xs text-muted">Pick a start date below to see every session.</p>
++            ) : !value.weekdays.length ? (
++              <p className="text-xs font-semibold text-rose-600">Choose at least one weekday.</p>
++            ) : (
++              <>
++                <p className="font-bold text-ink" data-testid="sched-summary">
++                  {dates.length} sessions · every {weekdayList(value.weekdays)}
++                </p>
++                <p className="text-xs text-muted">{formatDate(dates[0])} → {formatDate(dates[dates.length - 1])} · participants register once for all sessions</p>
++                <div className="mt-2 flex flex-wrap gap-1">
++                  {dates.slice(0, PREVIEW).map((d) => <span key={d} className="rounded-md bg-cream px-2 py-0.5 text-[11px] font-semibold text-ink-soft">{formatDate(d, true)}</span>)}
++                  {dates.length > PREVIEW && <span className="px-1 text-[11px] font-semibold text-muted">+{dates.length - PREVIEW} more</span>}
++                </div>
++              </>
++            )}
++          </div>
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/frontend/components/guru/AskGuru.tsx b/frontend/components/guru/AskGuru.tsx
+index cab8c296..3dc1cc6d 100644
+--- a/frontend/components/guru/AskGuru.tsx
++++ b/frontend/components/guru/AskGuru.tsx
+@@ -38,13 +38,12 @@ function domCohort(): PageCtx['cohort'] {
+   return cohortFromKey(document.querySelector('[data-guru-cohort]')?.getAttribute('data-guru-cohort'));
+ }
+ 
+-// Form-led screens where an auto-opening bubble on a phone would cover the
+-// primary action (Sign in, Get Started). The launcher itself stays available.
+-function isFormFlow(route: string): boolean {
+-  return (
+-    /^\/(login|signup|register|reset-password|verify-otp|join|choose-role)(\/|$)/.test(route) ||
+-    /^\/app\/org\/events\/new(\/|$)/.test(route)
+-  );
++// Form-led screens where an auto-opening bubble would cover the primary action
++// (Sign in on phones; the Event Creator's bottom-right "Get Started" / "Save &
++// Continue" on every screen size). The launcher itself stays available.
++function isFormFlow(route: string, phone: boolean): boolean {
++  if (/^\/app\/org\/events\/new(\/|$)/.test(route)) return true;
++  return phone && /^\/(login|signup|register|reset-password|verify-otp|join|choose-role)(\/|$)/.test(route);
+ }
+ 
+ function isPhone(): boolean {
+@@ -125,7 +124,7 @@ export default function AskGuru() {
+       setBubble(null);
+       return;
+     }
+-    if (isPhone() && isFormFlow(ctx.route)) {
++    if (isFormFlow(ctx.route, isPhone())) {
+       setBubble(null);
+       return;
+     }
+diff --git a/frontend/lib/org/pricing.ts b/frontend/lib/org/pricing.ts
+index e1cde5cd..2b201dde 100644
+--- a/frontend/lib/org/pricing.ts
++++ b/frontend/lib/org/pricing.ts
+@@ -51,9 +51,10 @@ export const DISCOUNT_TIERS: { tier: string; min: number; max: number; pct: Reco
+ 
+ export const tierFor = (participants: number) => (participants >= DISCOUNT_TIERS[1].min ? DISCOUNT_TIERS[1] : DISCOUNT_TIERS[0]);
+ 
+-export function estimate(cohort: CohortKey, months: Months, participants: number) {
++// `sessions` defaults to the published 2-a-week model; the Event Creator passes
++// the real session count of a scheduled programme.
++export function estimate(cohort: CohortKey, months: Months, participants: number, sessions: number = SESSIONS_PER_MONTH * months) {
+   const c = COHORT_RATES[cohort];
+-  const sessions = SESSIONS_PER_MONTH * months;
+   const pct = c.discounted ? tierFor(participants).pct[months] : 0;
+   const rate = (c.rate * (100 - pct)) / 100;
+   const perPerson = rate * sessions;
+diff --git a/frontend/lib/org/recommendations.ts b/frontend/lib/org/recommendations.ts
+new file mode 100644
+index 00000000..60c2c33b
+--- /dev/null
++++ b/frontend/lib/org/recommendations.ts
+@@ -0,0 +1,32 @@
++// Programme suggestions by organisation type (Phase D) — fixed, editorial rules
++// keyed on the Council programme slug. Shown as "Recommended for your
++// organisation" at the top of the Event Creator's Programme step. Any programme
++// can still be chosen; slugs that are not in the catalogue are simply skipped.
++import type { CohortKey } from '@/lib/org/cohort-copy';
++
++export type Suggestion = { slug: string; reason: string };
++
++export const RECOMMENDED: Record<CohortKey, Suggestion[]> = {
++  COMPANY: [
++    { slug: 'yoga-for-posture-back-care', reason: 'Eases desk-bound stiffness for teams who sit most of the day' },
++    { slug: 'yoga-for-stress-resilience', reason: 'Helps teams handle workload pressure and stay steady' },
++    { slug: 'yoga-for-focus-attention', reason: 'Supports focus through meeting-heavy, deep-work days' },
++  ],
++  EDUCATIONAL_INSTITUTION: [
++    { slug: 'yoga-for-focus-attention', reason: 'Supports concentration for study and exam readiness' },
++    { slug: 'yoga-for-emotional-wellbeing', reason: 'Builds emotional balance through the academic year' },
++    { slug: 'yoga-for-stress-resilience', reason: 'Helps students and faculty settle exam-season stress' },
++  ],
++  STARTUP_NETWORK: [
++    { slug: 'yoga-for-stress-resilience', reason: 'Steadies founders and teams through high-pressure growth' },
++    { slug: 'yoga-for-energy-stamina', reason: 'Sustains energy for long build-and-ship cycles' },
++    { slug: 'yoga-for-focus-attention', reason: 'Sharpens focus for clear decision-making' },
++  ],
++};
++
++export function recommendedFor<P extends { slug?: string | null }>(cohort: string, programmes: P[]): { prog: P; reason: string }[] {
++  const rules = RECOMMENDED[cohort as CohortKey] || [];
++  return rules
++    .map((r) => ({ prog: programmes.find((p) => p.slug === r.slug), reason: r.reason }))
++    .filter((x): x is { prog: P; reason: string } => !!x.prog);
++}
+diff --git a/frontend/lib/org/schedule.ts b/frontend/lib/org/schedule.ts
+new file mode 100644
+index 00000000..584279f3
+--- /dev/null
++++ b/frontend/lib/org/schedule.ts
+@@ -0,0 +1,52 @@
++// Repeating programme schedule — mirrors backend institutional._schedule_dates
++// (every chosen weekday from the start date, up to start + N calendar months).
++// Dates are handled in UTC so the preview never shifts across time zones.
++
++export type ScheduleValue = { type: 'SINGLE' | 'RECURRING'; weekdays: number[]; months: number };
++
++export const WEEKDAYS: { n: number; short: string }[] = [
++  { n: 1, short: 'Mon' }, { n: 2, short: 'Tue' }, { n: 3, short: 'Wed' }, { n: 4, short: 'Thu' },
++  { n: 5, short: 'Fri' }, { n: 6, short: 'Sat' }, { n: 7, short: 'Sun' },
++];
++export const SCHEDULE_MONTHS = [1, 3, 6, 12] as const;
++export const MAX_WEEKDAYS = 5;
++
++function parse(iso: string): Date | null {
++  if (!/^\d{4}-\d{2}-\d{2}/.test(iso || '')) return null;
++  const d = new Date(`${iso.slice(0, 10)}T00:00:00Z`);
++  return Number.isNaN(d.getTime()) ? null : d;
++}
++
++function addMonths(d: Date, months: number): Date {
++  const total = d.getUTCMonth() + months;
++  const y = d.getUTCFullYear() + Math.floor(total / 12);
++  const m = total % 12;
++  const lastDay = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
++  return new Date(Date.UTC(y, m, Math.min(d.getUTCDate(), lastDay)));
++}
++
++export function sessionDates(start: string, weekdays: number[], months: number): string[] {
++  const s = parse(start);
++  if (!s || !weekdays.length) return [];
++  const end = addMonths(s, months);
++  const days = new Set(weekdays);
++  const out: string[] = [];
++  for (const d = new Date(s); d < end; d.setUTCDate(d.getUTCDate() + 1)) {
++    if (days.has(d.getUTCDay() || 7)) out.push(d.toISOString().slice(0, 10));
++  }
++  return out;
++}
++
++// [2, 4] → "Tue & Thu"; [1, 3, 5] → "Mon, Wed & Fri"
++export function weekdayList(days: number[]): string {
++  const names = [...days].sort((a, b) => a - b).map((n) => WEEKDAYS[n - 1]?.short).filter(Boolean);
++  return names.length > 1 ? `${names.slice(0, -1).join(', ')} & ${names[names.length - 1]}` : names[0] || '';
++}
++
++export function formatDate(iso?: string | null, withWeekday = false): string {
++  const d = iso ? parse(iso) : null;
++  if (!d) return iso || '';
++  return d.toLocaleDateString('en-GB', {
++    timeZone: 'UTC', day: 'numeric', month: 'short', year: 'numeric', ...(withWeekday ? { weekday: 'short' } : {}),
++  });
++}
+diff --git a/frontend/lib/server/institutional.ts b/frontend/lib/server/institutional.ts
+index 1271c9ec..93a2e449 100644
+--- a/frontend/lib/server/institutional.ts
++++ b/frontend/lib/server/institutional.ts
+@@ -10,7 +10,7 @@ const BASE = (process.env.PULSE_API_URL || 'http://localhost:8001').replace(/\/$
+ const SECRET = process.env.PULSE_SHARED_SECRET || '';
+ const TIMEOUT_MS = 8000;
+ 
+-export type Actor = { user_id: string; name: string; role: string; persona?: string };
++export type Actor = { user_id: string; name: string; role: string; persona?: string; email?: string };
+ 
+ export function institutionalActor(user: User): Actor {
+   return {
+@@ -18,6 +18,9 @@ export function institutionalActor(user: User): Actor {
+     name: (user.name as string) || (user.email as string) || 'Member',
+     role: normalizeRole(user.role),
+     persona: personaLabel(user),
++    // Server-side session email — lets the engine attach organisations created
++    // for this person from an enquiry (Phase D) on their first signed-in visit.
++    email: (user.email as string) || undefined,
+   };
+ }
+ 
+@@ -192,6 +195,9 @@ export type PublicEvent = {
+     content_status?: string;
+   };
+   event_date?: string | null;
++  end_date?: string | null;
++  schedule?: { type: string; weekdays: number[]; months: number; session_count: number } | null;
++  sessions?: { seq: number; date: string; start_time?: string | null; duration_minutes?: number | null }[];
+   start_time?: string | null;
+   end_time?: string | null;
+   duration_minutes?: number | null;
+diff --git a/frontend/lib/server/org-enquiries.ts b/frontend/lib/server/org-enquiries.ts
+index 2bb6207a..ede728b8 100644
+--- a/frontend/lib/server/org-enquiries.ts
++++ b/frontend/lib/server/org-enquiries.ts
+@@ -46,6 +46,10 @@ export type OrgEnquiry = {
+   history: EnquiryHistory[];
+   notifications: { team?: EnquiryDelivery; ack?: EnquiryDelivery };
+   proposals?: EnquiryProposal[];
++  // Phase D — organisation created from this enquiry (pending until the contact signs in).
++  organisation_id?: string | null;
++  organisation?: { organisation_id: string; name: string; pending_owner_email?: string | null; claimed: boolean; claimed_at?: string | null } | null;
++  org_invite?: { to?: string | null; at?: string; status?: string; error?: string } | null;
+   created_at: string;
+   updated_at: string;
+ };
+diff --git a/frontend/tests/verify_phase_cd.ts b/frontend/tests/verify_phase_cd.ts
+new file mode 100644
+index 00000000..02c213a9
+--- /dev/null
++++ b/frontend/tests/verify_phase_cd.ts
+@@ -0,0 +1,54 @@
++// Phase C/D pure-logic checks — schedule generation, price estimate inputs,
++// programme suggestions. Run: node tests/verify_phase_cd.ts
++import { formatDate, sessionDates, weekdayList } from '../lib/org/schedule.ts';
++import { RECOMMENDED, recommendedFor } from '../lib/org/recommendations.ts';
++import { estimate, SESSIONS_PER_MONTH } from '../lib/org/pricing.ts';
++
++let failures = 0;
++function check(name: string, cond: boolean, got?: unknown) {
++  if (cond) console.log(`  \u2713 ${name}`);
++  else {
++    failures++;
++    console.error(`  \u2717 ${name}${got !== undefined ? ` (got ${JSON.stringify(got)})` : ''}`);
++  }
++}
++
++console.log('Multi-session schedule:');
++// 2027-03-01 is a Monday.
++const tt = sessionDates('2027-03-01', [2, 4], 1);
++check('Tue & Thu for 1 month from Mon 1 Mar 2027', tt.length === 9 && tt[0] === '2027-03-02' && tt[tt.length - 1] === '2027-03-30', tt);
++check('every date is a Tue or Thu', tt.every((d) => [2, 4].includes(new Date(`${d}T00:00:00Z`).getUTCDay())));
++const three = sessionDates('2027-03-01', [2, 4], 3);
++check('3 months ≈ 26 sessions', three.length === 26, three.length);
++check('month-end start clamps (31 Jan + 1 month stops before 28 Feb)', sessionDates('2027-01-31', [7], 1).at(-1) === '2027-02-21', sessionDates('2027-01-31', [7], 1));
++check('no weekdays → no sessions', sessionDates('2027-03-01', [], 3).length === 0);
++check('bad date → no sessions', sessionDates('', [1], 3).length === 0);
++check('weekdayList', weekdayList([4, 2]) === 'Tue & Thu' && weekdayList([1, 3, 5]) === 'Mon, Wed & Fri' && weekdayList([6]) === 'Sat');
++check('formatDate', formatDate('2027-03-02') === '2 Mar 2027', formatDate('2027-03-02'));
++
++console.log('Price estimate:');
++const def = estimate('COMPANY', 3, 20);
++check('default sessions = 8 a month', def.sessions === SESSIONS_PER_MONTH * 3);
++const real = estimate('COMPANY', 3, 20, 26);
++check('real session count used', real.sessions === 26 && real.total === 270 * 26 * 20, real);
++check('campus flat rate', estimate('EDUCATIONAL_INSTITUTION', 12, 40, 100).rate === 175);
++check('Tier 2 12-month startup = 30% off', estimate('STARTUP_NETWORK', 12, 35, 96).pct === 30);
++
++console.log('Programme suggestions:');
++const catalogue = [
++  'yoga-for-focus-attention', 'yoga-for-stress-resilience', 'yoga-for-better-sleep', 'yoga-for-emotional-wellbeing',
++  'yoga-for-strength-mobility', 'yoga-for-posture-back-care', 'yoga-for-energy-stamina', 'accessible-chair-yoga',
++].map((slug) => ({ slug, programme_id: slug }));
++check('company first pick is posture & back care', recommendedFor('COMPANY', catalogue)[0]?.prog.slug === 'yoga-for-posture-back-care');
++check('company includes stress resilience', recommendedFor('COMPANY', catalogue).some((r) => r.prog.slug === 'yoga-for-stress-resilience'));
++check('education starts with focus', recommendedFor('EDUCATIONAL_INSTITUTION', catalogue)[0]?.prog.slug === 'yoga-for-focus-attention');
++check('startup includes energy & stamina', recommendedFor('STARTUP_NETWORK', catalogue).some((r) => r.prog.slug === 'yoga-for-energy-stamina'));
++check('every rule has a reason', Object.values(RECOMMENDED).flat().every((r) => r.reason.length > 10));
++check('unknown slugs are skipped', recommendedFor('COMPANY', [{ slug: 'x', programme_id: 'x' }]).length === 0);
++check('unknown cohort → none', recommendedFor('NOPE', catalogue).length === 0);
++
++if (failures) {
++  console.error(`\n\u2717 PHASE C/D CHECKS FAILED \u2014 ${failures} assertion(s).`);
++  process.exit(1);
++}
++console.log('\n\u2713 PHASE C/D CHECKS PASSED');

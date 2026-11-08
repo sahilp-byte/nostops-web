@@ -1,0 +1,37 @@
+{
+  "name": "nostops-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -H 0.0.0.0 -p 3000",
+    "build": "next build",
+    "start": "next start -H 0.0.0.0 -p 3000",
+    "lint": "eslint .",
+    "test:site": "node tests/verify_site.mjs",
+    "test:seo": "node tests/verify_seo_feeds.mjs",
+    "test:access": "node tests/verify_access_matrix.ts",
+    "test:display": "node tests/verify_teacher_access_display.ts",
+    "test:pricing": "node tests/verify_instakyc_pricing.ts",
+    "test:no-nearby": "node tests/verify_no_nearby.mjs",
+    "test:lyv": "node tests/verify_lyv_landing.ts",
+    "test:tier2": "node tests/verify_tier2_preview.ts",
+    "test:checkout-routing": "node tests/verify_checkout_routing.ts"
+  },
+  "dependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^24",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "next": "16.3.3",
+    "postcss": "^8",
+    "qrcode.react": "^4.2.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  },
+  "devDependencies": {
+    "eslint": "^9",
+    "eslint-config-next": "16.3.3"
+  }
+}

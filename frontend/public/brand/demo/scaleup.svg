@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="ScaleUp Founders Network Pune">
+  <rect width="120" height="120" rx="26" fill="#FFF7ED"/>
+  <rect x="30" y="66" width="12" height="24" rx="3" fill="#FDBA74"/>
+  <rect x="54" y="52" width="12" height="38" rx="3" fill="#FB923C"/>
+  <rect x="78" y="34" width="12" height="56" rx="3" fill="#EA580C"/>
+  <path d="M30 60 L60 44 L90 26" fill="none" stroke="#C2410C" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="30" cy="60" r="5" fill="#C2410C"/>
+  <circle cx="60" cy="44" r="5" fill="#C2410C"/>
+  <circle cx="90" cy="26" r="5" fill="#C2410C"/>
+</svg>

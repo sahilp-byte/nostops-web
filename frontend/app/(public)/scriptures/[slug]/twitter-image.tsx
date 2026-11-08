@@ -1,0 +1,12 @@
+import { renderScriptureOg, OG_SIZE, OG_CONTENT_TYPE } from '@/lib/server/knowledge-og';
+
+export const runtime = 'nodejs';
+export const revalidate = 600;
+export const size = OG_SIZE;
+export const contentType = OG_CONTENT_TYPE;
+export const alt = 'NOSTOPS Yoga Scripture';
+
+export default async function TwitterImage({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  return renderScriptureOg(slug);
+}

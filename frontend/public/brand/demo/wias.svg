@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Western Institute of Applied Sciences">
+  <rect width="120" height="120" rx="26" fill="#EFF6FF"/>
+  <path d="M60 26 L94 44 L60 62 L26 44 Z" fill="#1D4ED8"/>
+  <path d="M34 52 V72 L60 86 L86 72 V52 L60 66 Z" fill="#3B82F6"/>
+  <circle cx="94" cy="44" r="4" fill="#1D4ED8"/>
+  <path d="M94 44 V60" stroke="#1D4ED8" stroke-width="3"/>
+  <circle cx="94" cy="62" r="3.5" fill="#93C5FD"/>
+</svg>
